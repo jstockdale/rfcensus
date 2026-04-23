@@ -1,0 +1,1 @@
+"""rfcensus CLI commands."""

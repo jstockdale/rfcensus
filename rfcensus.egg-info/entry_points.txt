@@ -1,0 +1,2 @@
+[console_scripts]
+rfcensus = rfcensus.cli:main

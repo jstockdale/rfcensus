@@ -1,0 +1,89 @@
+# Built-in antenna profiles. Users reference these by id in their
+# site.toml or define their own custom antennas inline there.
+
+[[antenna]]
+id = "whip_generic_small"
+name = "Generic small telescoping whip"
+antenna_type = "whip"
+resonant_freq_hz = 0
+usable_range = [24_000_000, 1_700_000_000]
+gain_dbi = 0.0
+polarization = "vertical"
+notes = "Dongle stock antenna. Works everywhere, excels nowhere."
+
+[[antenna]]
+id = "whip_315"
+name = "315 MHz tuned whip (23.8 cm quarter-wave)"
+antenna_type = "whip"
+resonant_freq_hz = 315_000_000
+# Generic quarter-wave whip. For a survey tool we care about whether
+# the antenna can DETECT signals, not whether it's optimally matched.
+# ±35% is realistic for detection with modest mismatch loss — covers
+# adjacent bands like 345 MHz Honeywell, 433 MHz ISM, 270 MHz. Users
+# with purpose-built narrowband products (e.g. Diamond X510) should
+# define their own custom stanza with a tighter range.
+usable_range = [204_000_000, 425_000_000]
+gain_dbi = 2.15
+polarization = "vertical"
+
+[[antenna]]
+id = "whip_433"
+name = "433 MHz tuned whip (17.3 cm quarter-wave)"
+antenna_type = "whip"
+resonant_freq_hz = 433_920_000
+# ±35% for survey use — covers 315 MHz TPMS, 450 MHz UHF, 462 FRS/GMRS
+usable_range = [282_000_000, 586_000_000]
+gain_dbi = 2.15
+polarization = "vertical"
+
+[[antenna]]
+id = "whip_915"
+name = "915 MHz tuned whip (8.2 cm quarter-wave)"
+antenna_type = "whip"
+resonant_freq_hz = 915_000_000
+# ±35% for survey use — covers 700-800 MHz P25 public safety,
+# 868 MHz EU ISM, 915 MHz US ISM, 929 MHz POCSAG, up toward 1090 ADS-B
+usable_range = [594_000_000, 1_235_000_000]
+gain_dbi = 2.15
+polarization = "vertical"
+
+[[antenna]]
+id = "dipole_1090"
+name = "1090 MHz ADS-B dipole"
+antenna_type = "dipole"
+resonant_freq_hz = 1_090_000_000
+usable_range = [1_000_000_000, 1_200_000_000]
+gain_dbi = 2.5
+polarization = "vertical"
+
+[[antenna]]
+id = "discone"
+name = "Generic outdoor discone"
+antenna_type = "discone"
+usable_range = [25_000_000, 1_300_000_000]
+gain_dbi = 0.0
+polarization = "vertical"
+notes = "Wideband workhorse. Flat-ish gain across a huge range."
+
+[[antenna]]
+id = "marine_vhf"
+name = "Marine VHF antenna (156-162 MHz)"
+antenna_type = "whip"
+resonant_freq_hz = 156_800_000
+# Tuned for marine band but a quarter-wave at this length is usable
+# from ~140 to ~180 MHz with degraded but still useful performance
+# (VSWR < 3:1). Covers 144 MHz amateur, NOAA weather, business VHF.
+usable_range = [137_000_000, 180_000_000]
+gain_dbi = 3.0
+polarization = "vertical"
+notes = "Good for AIS and marine voice if you live coastal."
+
+[[antenna]]
+id = "magmount_800_900"
+name = "Magnetic mount 800-900 MHz"
+antenna_type = "whip"
+resonant_freq_hz = 870_000_000
+usable_range = [800_000_000, 960_000_000]
+gain_dbi = 3.0
+polarization = "vertical"
+notes = "Good for 915 ISM, cellular monitoring, and 900 MHz meters."

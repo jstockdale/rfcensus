@@ -1,0 +1,344 @@
+# Built-in US band definitions shipped with rfcensus.
+# Users can override any of these in their site config.
+#
+# strategy values:
+#   decoder_only     – run decoders, no power scan
+#   decoder_primary  – decoders + light power scan
+#   power_primary    – power scan first, decoders on active channels
+#   exploration      – power scan only, flag for user review
+
+[[band]]
+id = "315_security"
+name = "315 MHz (legacy security, older fobs, TPMS)"
+freq_low = 314_900_000
+freq_high = 315_100_000
+region = "US"
+expected_signals = ["keyfob", "garage_door", "older_tpms", "security_sensor"]
+suggested_decoders = ["rtl_433"]
+strategy = "decoder_primary"
+typical_activity = "rare"
+# OOK bursts ~10-40 kHz wide. 25 kHz bins catch bursts cleanly
+# without the narrow-bin noise you'd get from sub-10kHz.
+power_scan_bin_hz = 25_000
+
+[[band]]
+id = "interlogix_security"
+name = "319.5 MHz (GE/Interlogix security)"
+freq_low = 319_450_000
+freq_high = 319_550_000
+region = "US"
+expected_signals = ["interlogix_security"]
+suggested_decoders = ["rtl_433"]
+strategy = "decoder_primary"
+typical_activity = "rare"
+# Interlogix uses ~40 kHz FSK bursts; 25 kHz bins resolve them
+power_scan_bin_hz = 25_000
+
+[[band]]
+id = "honeywell_security"
+name = "345 MHz (Honeywell 5800 security)"
+freq_low = 344_900_000
+freq_high = 345_100_000
+region = "US"
+expected_signals = ["honeywell_security"]
+suggested_decoders = ["rtl_433"]
+strategy = "decoder_primary"
+typical_activity = "rare"
+power_scan_bin_hz = 25_000
+
+[[band]]
+id = "433_ism"
+name = "433 MHz ISM"
+freq_low = 433_050_000
+freq_high = 434_790_000
+region = "US"
+expected_signals = ["tpms", "weather_station", "remote_switch", "doorbell", "iot"]
+suggested_decoders = ["rtl_433"]
+strategy = "decoder_primary"
+typical_activity = "constant"
+# Mix of OOK (weather stations, TPMS) and narrow FSK. 25 kHz bins
+# catches all typical burst widths; finer bins just average noise.
+power_scan_bin_hz = 25_000
+
+[[band]]
+id = "frs_gmrs"
+name = "FRS/GMRS walkie-talkies (462-467 MHz)"
+freq_low = 462_000_000
+freq_high = 467_750_000
+region = "US"
+expected_signals = ["frs_voice", "gmrs_voice"]
+suggested_decoders = []
+strategy = "power_primary"
+typical_activity = "intermittent"
+# FRS/GMRS channels are 12.5 kHz (narrowband) spaced every 12.5 or
+# 25 kHz. 12.5 kHz bins resolve individual channels.
+power_scan_bin_hz = 12_500
+
+[[band]]
+id = "915_ism"
+name = "902-928 MHz ISM"
+freq_low = 902_000_000
+freq_high = 928_000_000
+region = "US"
+expected_signals = ["ert_meter", "r900_meter", "zwave", "lora", "meshtastic", "iot"]
+suggested_decoders = ["rtlamr", "rtl_433"]
+strategy = "decoder_primary"
+power_scan_parallel = true
+typical_activity = "constant"
+# Default heuristic would give 101 kHz bins — too coarse for SCM
+# meters (~75 kHz BW), Z-Wave (40-200 kHz), or LoRa (125 kHz).
+# 25 kHz bins resolve all but the narrowest features and give a
+# clean occupancy map for 32 FHSS ERT channel hops.
+power_scan_bin_hz = 25_000
+# rtlamr (the primary decoder) tunes to band.center_hz = 915 MHz
+# and only demodulates ±1.2 MHz at the default 2.4 Msps, giving
+# visibility into 913.8-916.2 MHz. The companion band 915_ism_r900
+# below adds a second pass at 912.6 MHz to cover R900 water meters
+# (fixed freq) and the lower portion of the ERT FHSS band that
+# this one misses.
+
+[[band]]
+id = "915_ism_r900"
+name = "915 ISM second pass — R900 at 912.6 MHz"
+# Narrow 2.4 MHz window around 912.6 MHz, matching rtlamr's
+# default demod bandwidth. Strategy is decoder_only since
+# the 915_ism band above already does the full-ISM power scan.
+freq_low = 911_400_000
+freq_high = 913_800_000
+region = "US"
+expected_signals = ["r900_meter", "r900bcd_meter", "ert_meter"]
+suggested_decoders = ["rtlamr"]
+strategy = "decoder_only"
+typical_activity = "constant"
+# Custom rtlamr msgtype for this band: rather than "all" (scm+scm+,
+# idm, r900), target the protocols most likely to appear at 912.6
+# MHz. Including r900bcd here is fine because THIS rtlamr instance
+# isn't competing with other protocols — it gets the dongle's CPU
+# budget to itself. Including r900bcd on the primary 915_ism pass
+# (which already runs scm/scm+/idm/r900) was what pushed rtlamr
+# past the drop threshold in v0.5.31.
+[band.decoder_options.rtlamr]
+msgtype = "r900,r900bcd,idm,netidm"
+# WHY THIS BAND EXISTS:
+#
+# R900 water meters (Neptune / Master Meter / etc.) transmit at a
+# fixed 912.38 / 912.6 MHz pair. The primary 915_ism band centers
+# at 915 MHz, which puts R900 ~2.4 MHz below the center — outside
+# rtlamr's ±1.2 MHz demodulation window at 2.4 Msps. Result: R900
+# meters are completely invisible to the primary pass even though
+# they're strong local signals.
+#
+# SCM/SCM+/IDM FHSS meters hop across the full 902-928 MHz band.
+# A single 2.4 MHz window catches each meter ~9% of the time per
+# transmission. Adding this second pass at 912.6 MHz nearly
+# doubles ERT capture rate (9% → 18%) plus gives 100% R900
+# coverage.
+#
+# Scheduling: the wave scheduler will place this band in a later
+# wave where the whip_915 dongle is free (your plan typically has
+# the 915 MHz dongle idle in wave 3 or later). No wave count
+# increase vs. the current plan.
+#
+# Future: a third pass at 919.2 MHz would cover 918.0-920.4 MHz,
+# filling the upper half of the ISM band. Conservative for now —
+# start with the R900-specific pass and evaluate after a scan.
+
+[[band]]
+id = "pocsag_929"
+name = "929-932 MHz paging (POCSAG/FLEX)"
+freq_low = 929_000_000
+freq_high = 932_000_000
+region = "US"
+expected_signals = ["pocsag", "flex"]
+suggested_decoders = ["multimon"]
+strategy = "decoder_primary"
+typical_activity = "intermittent"
+# POCSAG/FLEX paging on 25 kHz channels (some narrowband 12.5).
+# 6.25 kHz bins give strong channel-level occupancy at the cost
+# of ~500 bins across the 3 MHz span — trivial for rtl_power.
+power_scan_bin_hz = 6_250
+
+[[band]]
+id = "ais"
+name = "AIS maritime 162 MHz"
+freq_low = 161_960_000
+freq_high = 162_040_000
+region = "US"
+expected_signals = ["ais_class_a", "ais_class_b"]
+suggested_decoders = ["rtl_ais"]
+strategy = "decoder_only"
+typical_activity = "constant"  # near coast; rare inland
+# AIS channels A (161.975) and B (162.025) are 25 kHz GMSK.
+# 12.5 kHz bins place each channel in its own bin cleanly.
+power_scan_bin_hz = 12_500
+
+[[band]]
+id = "aprs_2m"
+name = "APRS 144.39 MHz (2m amateur)"
+freq_low = 144_380_000
+freq_high = 144_400_000
+region = "NA"
+expected_signals = ["aprs"]
+suggested_decoders = ["direwolf", "multimon"]
+strategy = "decoder_only"
+typical_activity = "intermittent"
+# APRS is 1200 bps AFSK on a single 20 kHz FM channel at 144.39.
+# 5 kHz bins give clean centering within the single-channel span.
+power_scan_bin_hz = 5_000
+
+[[band]]
+id = "nws_weather"
+name = "NOAA Weather Radio (162.4-162.55)"
+freq_low = 162_400_000
+freq_high = 162_550_000
+region = "US"
+expected_signals = ["nws_voice", "eas"]
+suggested_decoders = []
+strategy = "power_primary"
+typical_activity = "constant"
+# NOAA WX has 7 spot channels at 25 kHz spacing (162.400, .425,
+# .450, .475, .500, .525, .550). 10 kHz bins resolve each.
+power_scan_bin_hz = 10_000
+
+[[band]]
+id = "marine_vhf"
+name = "Marine VHF voice (156-162 MHz)"
+freq_low = 156_000_000
+freq_high = 162_000_000
+region = "US"
+expected_signals = ["marine_voice"]
+suggested_decoders = []
+strategy = "power_primary"
+typical_activity = "intermittent"
+# Marine VHF channels are 25 kHz FM. 12.5 kHz bins resolve each
+# channel center plus edges. 6MHz span → ~480 bins.
+power_scan_bin_hz = 12_500
+
+[[band]]
+id = "business_vhf"
+name = "Business/land mobile VHF (150-174)"
+freq_low = 150_000_000
+freq_high = 174_000_000
+region = "US"
+expected_signals = ["public_safety", "business_voice", "pocsag"]
+suggested_decoders = ["multimon"]
+strategy = "power_primary"
+typical_activity = "intermittent"
+# FCC VHF business/LMR is narrowband (12.5 kHz) post-2013
+# refarming. 12.5 kHz bins hit each channel centered. 24 MHz span
+# → ~1920 bins, still modest FFT load.
+power_scan_bin_hz = 12_500
+
+[[band]]
+id = "business_uhf"
+name = "Business/land mobile UHF (450-470)"
+freq_low = 450_000_000
+freq_high = 470_000_000
+region = "US"
+expected_signals = ["public_safety", "business_voice", "dmr", "p25"]
+suggested_decoders = []
+strategy = "power_primary"
+typical_activity = "intermittent"
+# Like business VHF, post-refarming narrowband 12.5 kHz channels.
+# DMR is 12.5 kHz TDMA (two slots), P25 Phase 1 is 12.5 kHz FDMA.
+power_scan_bin_hz = 12_500
+
+[[band]]
+id = "p25_700_public_safety"
+name = "700 MHz P25 trunked public safety (764-776)"
+freq_low = 764_000_000
+freq_high = 776_000_000
+region = "US"
+# 700 MHz public safety narrowband allocation (former TV ch 63-64).
+# Used for P25 Phase 1 and Phase 2 trunked systems by many US
+# agencies. The p25 detector picks up voice and control channels.
+expected_signals = ["public_safety", "p25"]
+suggested_decoders = ["p25"]
+strategy = "decoder_primary"
+typical_activity = "constant"
+# P25 Phase 1 is 12.5 kHz C4FM FDMA; Phase 2 is 12.5 kHz two-slot
+# TDMA. 10 kHz bins resolve individual channels cleanly without
+# blowing up FFT size on the 12 MHz span (~1200 bins).
+power_scan_bin_hz = 10_000
+
+[[band]]
+id = "p25_800_public_safety"
+name = "800 MHz P25 trunked public safety (851-869)"
+freq_low = 851_000_000
+freq_high = 869_000_000
+region = "US"
+# 800 MHz NPSPAC + rebanded public safety. Very commonly used by
+# large metro and county agencies. Most active P25 traffic in the
+# US lives here along with 700 MHz.
+expected_signals = ["public_safety", "p25"]
+suggested_decoders = ["p25"]
+strategy = "decoder_primary"
+typical_activity = "constant"
+# Same 12.5 kHz P25 channel spacing as 700 MHz. 10 kHz bins →
+# ~1800 bins across the 18 MHz span, still cheap on modern CPUs.
+power_scan_bin_hz = 10_000
+
+[[band]]
+id = "70cm_amateur"
+name = "70cm amateur (420-450 MHz)"
+freq_low = 420_000_000
+freq_high = 450_000_000
+region = "US"
+expected_signals = ["amateur_voice", "amateur_data"]
+suggested_decoders = []
+strategy = "power_primary"
+typical_activity = "intermittent"
+# Amateur 70cm is a mix: FM repeaters at 15/20 kHz spacing,
+# narrowband digital, packet. 10 kHz bins cover all typical
+# mode widths. 30 MHz span → ~3000 bins.
+power_scan_bin_hz = 10_000
+
+# ---- Opt-in bands (explicit enable required) ----
+
+[[band]]
+id = "adsb"
+name = "ADS-B 1090 MHz"
+freq_low = 1_090_000_000
+freq_high = 1_090_000_000
+region = "global"
+expected_signals = ["adsb_1090es"]
+suggested_decoders = ["dump1090"]
+strategy = "decoder_only"
+typical_activity = "constant"
+opt_in = true
+
+[[band]]
+id = "uat"
+name = "UAT 978 MHz (US GA)"
+freq_low = 978_000_000
+freq_high = 978_000_000
+region = "US"
+expected_signals = ["adsb_uat", "faa_uplink"]
+suggested_decoders = ["dump978"]
+strategy = "decoder_only"
+typical_activity = "intermittent"
+opt_in = true
+
+[[band]]
+id = "acars"
+name = "ACARS 131 MHz (aircraft datalink)"
+freq_low = 131_400_000
+freq_high = 131_600_000
+region = "global"
+expected_signals = ["acars"]
+suggested_decoders = ["acarsdec"]
+strategy = "decoder_only"
+typical_activity = "intermittent"
+opt_in = true
+
+[[band]]
+id = "vdlm2"
+name = "VDL Mode 2 (aircraft VHF data, 136 MHz)"
+freq_low = 136_500_000
+freq_high = 137_000_000
+region = "global"
+expected_signals = ["vdlm2"]
+suggested_decoders = ["vdlm2dec"]
+strategy = "decoder_only"
+typical_activity = "intermittent"
+opt_in = true
