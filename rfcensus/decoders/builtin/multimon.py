@@ -3,17 +3,38 @@
 multimon-ng decodes a variety of narrowband formats from demodulated
 audio: POCSAG (512/1200/2400), FLEX, APRS AX.25, DTMF, EAS, and more.
 
-multimon-ng doesn't talk to SDR hardware directly. We pipe IQ from
-`rtl_fm` (or equivalent) through it. This means for each frequency we
-want to monitor, we need a separate (rtl_fm -> multimon-ng) pipeline.
-In the current broker model we use the exclusive rtl_fm path; shared
-access via rtl_tcp is possible but awkward and we defer that.
+v0.5.37 rewrite: pipe IQ through `rfcensus.tools.fm_bridge` instead of
+the exclusive `rtl_fm` binary. The bridge connects to rtl_tcp (via the
+broker's fanout), demodulates FM in Python (numpy/scipy), and emits
+int16 PCM to stdout that multimon-ng reads from stdin.
+
+This lets multiple decoders share one dongle via rtl_tcp — multimon
+can now coexist with direwolf on the APRS band, with rtl_433 on
+paging bands, etc. No more "one decoder per physical USB device"
+wave packing bottleneck.
+
+Pipeline:
+
+    python -m rfcensus.tools.fm_bridge \\
+        --rtl-tcp HOST:PORT \\
+        --freq FREQ_HZ \\
+        --input-rate 2400000 \\
+        --output-rate 22050 \\
+        --gain auto
+      | multimon-ng -t raw -a POCSAG512 ... -f alpha -
+
+If we're allocated an EXCLUSIVE lease for whatever reason (e.g., the
+broker couldn't set up rtl_tcp, or sharing was disabled by config),
+fm_bridge can't connect — so exclusive leases fall through to the
+legacy rtl_fm path. This keeps old behavior as a safety net and
+ensures multimon still works on hardware setups where rtl_tcp fails.
 """
 
 from __future__ import annotations
 
 import asyncio
 import re
+import sys
 from datetime import datetime, timezone
 
 from rfcensus.decoders.base import (
@@ -45,79 +66,85 @@ class MultimonDecoder(DecoderBase):
             (440_000_000, 470_000_000),
             (929_000_000, 932_000_000),
         ),
-        min_sample_rate=22_050,
-        preferred_sample_rate=22_050,
-        requires_exclusive_dongle=True,
+        # min_sample_rate is what the BROKER-visible sample rate must be:
+        # since fm_bridge consumes IQ from rtl_tcp at whatever rate rtl_tcp
+        # is running at (default 2.4 Msps), the capability is expressed in
+        # IQ-sample-rate terms, NOT the 22050 Hz audio rate that multimon
+        # itself sees downstream of fm_bridge. This matters because the
+        # broker compares capabilities to DongleCapabilities.
+        min_sample_rate=1_024_000,
+        preferred_sample_rate=2_400_000,
+        # v0.5.37: shared access. fm_bridge connects to rtl_tcp and
+        # decodes IQ to audio in Python, so multimon can coexist with
+        # other shared-mode decoders (direwolf, rtl_433, rtlamr) on
+        # one dongle.
+        requires_exclusive_dongle=False,
         external_binary="multimon-ng",
         cpu_cost="moderate",
-        description="Decodes POCSAG, FLEX, APRS, and other narrowband modes from NFM audio",
+        description=(
+            "Decodes POCSAG, FLEX, APRS, and other narrowband modes "
+            "from NFM audio (uses fm_bridge + rtl_tcp for sharing)"
+        ),
     )
 
     async def check_available(self) -> DecoderAvailability:
         multimon = which(self.settings.binary or "multimon-ng")
-        rtl_fm = which("rtl_fm")
         if multimon is None:
             return DecoderAvailability(
                 name=self.name,
                 available=False,
                 reason="multimon-ng not on PATH",
             )
-        if rtl_fm is None:
-            return DecoderAvailability(
-                name=self.name,
-                available=False,
-                reason="rtl_fm not on PATH (install rtl-sdr package)",
-            )
-        return DecoderAvailability(name=self.name, available=True, binary_path=multimon)
+        # fm_bridge is provided by rfcensus itself (numpy/scipy);
+        # no external binary beyond multimon is required for the
+        # shared-access path. If this lease turns out to be exclusive
+        # (no rtl_tcp), we'll fall back to rtl_fm, which is checked
+        # at run() time.
+        return DecoderAvailability(
+            name=self.name, available=True, binary_path=multimon
+        )
 
     async def run(self, spec: DecoderRunSpec) -> DecoderResult:
         result = DecoderResult(name=self.name)
         lease = spec.lease
         freq_hz = spec.freq_hz
-        rtl_fm = which("rtl_fm")
         multimon = which(self.settings.binary or "multimon-ng")
-        if rtl_fm is None or multimon is None:
-            result.errors.append("rtl_fm and/or multimon-ng not available")
+        if multimon is None:
+            result.errors.append("multimon-ng not available")
             result.ended_reason = "binary_missing"
             return result
 
-        index = lease.dongle.driver_index if lease.dongle.driver_index is not None else 0
+        endpoint = lease.endpoint()
+        if endpoint is not None:
+            # Shared path: fm_bridge | multimon
+            shell_cmd = _build_shared_shell_cmd(
+                endpoint=endpoint,
+                freq_hz=freq_hz,
+                input_rate=spec.sample_rate,
+                gain=spec.gain or "auto",
+                multimon_binary=multimon,
+            )
+            proc_name = f"multimon[shared@{lease.dongle.id}@{freq_hz}]"
+        else:
+            # Exclusive path: rtl_fm | multimon (legacy)
+            rtl_fm = which("rtl_fm")
+            if rtl_fm is None:
+                result.errors.append(
+                    "rtl_fm not available for exclusive multimon path"
+                )
+                result.ended_reason = "binary_missing"
+                return result
+            shell_cmd = _build_exclusive_shell_cmd(
+                rtl_fm_binary=rtl_fm,
+                driver_index=lease.dongle.driver_index or 0,
+                freq_hz=freq_hz,
+                multimon_binary=multimon,
+            )
+            proc_name = f"multimon[exclusive@{lease.dongle.id}@{freq_hz}]"
 
-        # Build the pipeline: rtl_fm demod NFM at 22050 Hz audio | multimon-ng
-        rtl_fm_args = [
-            rtl_fm,
-            "-d", str(index),
-            "-f", str(freq_hz),
-            "-M", "fm",
-            "-s", "22050",
-            "-g", "40",
-            "-l", "0",
-            "-E", "deemp",
-            "-",
-        ]
-        multimon_args = [
-            multimon,
-            "-t", "raw",
-            "-a", "POCSAG512",
-            "-a", "POCSAG1200",
-            "-a", "POCSAG2400",
-            "-a", "FLEX",
-            "-a", "AFSK1200",  # APRS uses AFSK1200
-            "-a", "DTMF",
-            "-a", "EAS",
-            "-f", "alpha",
-            "-",
-        ]
-
-        # asyncio subprocess piping is awkward; use a shell
-        shell_cmd = " ".join(
-            [_shell_quote(a) for a in rtl_fm_args]
-            + ["2>/dev/null", "|"]
-            + [_shell_quote(a) for a in multimon_args]
-        )
         proc = ManagedProcess(
             ProcessConfig(
-                name=f"multimon[{lease.dongle.id}@{freq_hz}]",
+                name=proc_name,
                 args=["sh", "-c", shell_cmd],
                 log_stderr=True,
                 stderr_log_level="DEBUG",
@@ -129,8 +156,7 @@ class MultimonDecoder(DecoderBase):
             log.warning(
                 "multimon-ng NOT INSTALLED or not on PATH: %s. "
                 "Install via `apt install multimon-ng` (Debian/Ubuntu) or "
-                "`brew install multimon-ng` (macOS). Note multimon also "
-                "requires rtl_fm to be available. Skipping multimon for "
+                "`brew install multimon-ng` (macOS). Skipping multimon for "
                 "this band.",
                 exc,
             )
@@ -162,6 +188,99 @@ class MultimonDecoder(DecoderBase):
                 stop_task.cancel()
             await proc.stop()
         return result
+
+
+# ----------------------------------------------------------------
+# Shell pipeline builders
+# ----------------------------------------------------------------
+
+
+_MULTIMON_AUDIO_RATE = 22_050
+
+
+def _build_shared_shell_cmd(
+    *,
+    endpoint: tuple[str, int],
+    freq_hz: int,
+    input_rate: int,
+    gain: str,
+    multimon_binary: str,
+) -> str:
+    """Build the shared-access pipeline:
+        python -m rfcensus.tools.fm_bridge ... | multimon-ng ... -
+
+    Uses sys.executable to ensure we use the same Python interpreter
+    rfcensus is running under (the `rfcensus.tools` module must be
+    importable, so it needs to be the same env).
+    """
+    host, port = endpoint
+    python = sys.executable
+    fm_bridge_args = [
+        python, "-m", "rfcensus.tools.fm_bridge",
+        "--rtl-tcp", f"{host}:{port}",
+        "--freq", str(freq_hz),
+        "--input-rate", str(input_rate),
+        "--output-rate", str(_MULTIMON_AUDIO_RATE),
+        "--gain", gain,
+    ]
+    multimon_args = [
+        multimon_binary,
+        "-t", "raw",
+        "-a", "POCSAG512",
+        "-a", "POCSAG1200",
+        "-a", "POCSAG2400",
+        "-a", "FLEX",
+        "-a", "AFSK1200",  # APRS uses AFSK1200
+        "-a", "DTMF",
+        "-a", "EAS",
+        "-f", "alpha",
+        "-",
+    ]
+    return " ".join(
+        [_shell_quote(a) for a in fm_bridge_args]
+        + ["2>/dev/null", "|"]
+        + [_shell_quote(a) for a in multimon_args]
+    )
+
+
+def _build_exclusive_shell_cmd(
+    *,
+    rtl_fm_binary: str,
+    driver_index: int,
+    freq_hz: int,
+    multimon_binary: str,
+) -> str:
+    """Legacy exclusive-access pipeline using rtl_fm. Retained for
+    fallback when shared access (rtl_tcp) isn't available."""
+    rtl_fm_args = [
+        rtl_fm_binary,
+        "-d", str(driver_index),
+        "-f", str(freq_hz),
+        "-M", "fm",
+        "-s", str(_MULTIMON_AUDIO_RATE),
+        "-g", "40",
+        "-l", "0",
+        "-E", "deemp",
+        "-",
+    ]
+    multimon_args = [
+        multimon_binary,
+        "-t", "raw",
+        "-a", "POCSAG512",
+        "-a", "POCSAG1200",
+        "-a", "POCSAG2400",
+        "-a", "FLEX",
+        "-a", "AFSK1200",
+        "-a", "DTMF",
+        "-a", "EAS",
+        "-f", "alpha",
+        "-",
+    ]
+    return " ".join(
+        [_shell_quote(a) for a in rtl_fm_args]
+        + ["2>/dev/null", "|"]
+        + [_shell_quote(a) for a in multimon_args]
+    )
 
 
 # multimon-ng output lines look like:

@@ -24,6 +24,7 @@ rfcensus/commands/guided.py
 rfcensus/commands/init.py
 rfcensus/commands/inventory.py
 rfcensus/commands/list.py
+rfcensus/commands/monitor.py
 rfcensus/commands/serialize.py
 rfcensus/commands/setup.py
 rfcensus/commands/suggest.py
@@ -49,6 +50,8 @@ rfcensus/detectors/builtin/lora.py
 rfcensus/detectors/builtin/p25.py
 rfcensus/detectors/builtin/wifi_bt.py
 rfcensus/engine/__init__.py
+rfcensus/engine/confirmation_queue.py
+rfcensus/engine/confirmation_task.py
 rfcensus/engine/coverage.py
 rfcensus/engine/dispatcher.py
 rfcensus/engine/scheduler.py
@@ -83,6 +86,7 @@ rfcensus/spectrum/classifier.py
 rfcensus/spectrum/iq_capture.py
 rfcensus/spectrum/noise_floor.py
 rfcensus/spectrum/occupancy.py
+rfcensus/spectrum/wide_channel_aggregator.py
 rfcensus/spectrum/backends/__init__.py
 rfcensus/spectrum/backends/hackrf_sweep.py
 rfcensus/spectrum/backends/rtl_power.py
@@ -93,6 +97,9 @@ rfcensus/storage/repositories.py
 rfcensus/storage/retention.py
 rfcensus/storage/schema.py
 rfcensus/storage/writer.py
+rfcensus/tools/__init__.py
+rfcensus/tools/dsp.py
+rfcensus/tools/fm_bridge.py
 rfcensus/utils/__init__.py
 rfcensus/utils/async_subprocess.py
 rfcensus/utils/hashing.py

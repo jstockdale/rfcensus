@@ -235,11 +235,25 @@ class AnomalyWriter:
 
 
 class DetectionWriter:
-    """Persists DetectionEvents to the detections table."""
+    """Persists DetectionEvents to the detections table.
 
-    def __init__(self, repo: DetectionRepo, session_id: int):
+    v0.5.41: if a confirmation queue is wired in AND the detection's
+    metadata contains `needs_iq_confirmation=True`, submits a
+    ConfirmationTask to the queue using the freshly-assigned
+    detection_id. This is how LoRa-family detections get deferred
+    SF/variant classification without the detector itself needing
+    direct access to the queue.
+    """
+
+    def __init__(
+        self,
+        repo: DetectionRepo,
+        session_id: int,
+        confirmation_queue: "ConfirmationQueue | None" = None,
+    ):
         self.repo = repo
         self.session_id = session_id
+        self.confirmation_queue = confirmation_queue
 
     async def handle(self, event: DetectionEvent) -> None:
         record = DetectionRecord(
@@ -255,7 +269,20 @@ class DetectionWriter:
             detected_at=event.timestamp,
             metadata=dict(event.metadata),
         )
-        await self.repo.insert(record)
+        detection_id = await self.repo.insert(record)
+
+        # v0.5.41: auto-submit to confirmation queue if requested
+        needs_confirmation = bool(event.metadata.get("needs_iq_confirmation"))
+        if needs_confirmation and self.confirmation_queue is not None:
+            from rfcensus.engine.confirmation_queue import ConfirmationTask
+            task = ConfirmationTask(
+                detection_id=detection_id,
+                freq_hz=event.freq_hz,
+                bandwidth_hz=event.bandwidth_hz or 0,
+                technology=event.technology,
+                detector_name=event.detector_name,
+            )
+            await self.confirmation_queue.submit(task)
 
 
 def attach_writers(
@@ -267,11 +294,18 @@ def attach_writers(
     detection_repo: DetectionRepo | None = None,
     *,
     capture_power: bool = False,
+    confirmation_queue: "ConfirmationQueue | None" = None,
 ) -> PowerSampleBatcher | None:
     """Subscribe persistence consumers to the bus.
 
     Returns the PowerSampleBatcher if `capture_power=True` so the caller
     can stop it at shutdown.
+
+    v0.5.41: if `confirmation_queue` is provided AND `detection_repo`
+    is available, DetectionEvents whose metadata contains
+    `needs_iq_confirmation=True` are automatically submitted to the
+    queue after persistence (so the ConfirmationTask carries the real
+    detection_id, not a placeholder).
     """
     channel_writer = ActiveChannelWriter(active_channel_repo, session_id)
     bus.subscribe(ActiveChannelEvent, channel_writer.handle)
@@ -280,7 +314,10 @@ def attach_writers(
     bus.subscribe(AnomalyEvent, anomaly_writer.handle)
 
     if detection_repo is not None:
-        detection_writer = DetectionWriter(detection_repo, session_id)
+        detection_writer = DetectionWriter(
+            detection_repo, session_id,
+            confirmation_queue=confirmation_queue,
+        )
         bus.subscribe(DetectionEvent, detection_writer.handle)
 
     batcher: PowerSampleBatcher | None = None

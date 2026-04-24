@@ -68,6 +68,12 @@ class OccupancyAnalyzer:
     tracker_window: int = 120
     tracker_percentile: float = 0.25
     emit_power_samples: bool = False
+    # Optional sidecar that aggregates above-floor samples into
+    # wide-bandwidth composite events (for LoRa / Meshtastic / etc.).
+    # When present, every above-floor sample is ALSO reported to the
+    # aggregator — the per-bin ActiveChannelEvent emission path is
+    # unchanged. See spectrum.wide_channel_aggregator for details.
+    wide_aggregator: object | None = None
 
     def __post_init__(self) -> None:
         self._tracker = NoiseFloorTracker(
@@ -123,6 +129,20 @@ class OccupancyAnalyzer:
         history.observe(now, sample.power_dbm, above_floor)
 
         if above_floor:
+            # Feed the wide-channel aggregator BEFORE the hold-time
+            # debouncing. LoRa bursts (<1s) never cross the hold time
+            # so waiting until state.sample_count accumulates would
+            # miss them entirely. See spectrum.wide_channel_aggregator.
+            if self.wide_aggregator is not None:
+                await self.wide_aggregator.observe(
+                    freq_hz=sample.freq_hz,
+                    bin_width_hz=sample.bin_width_hz,
+                    power_dbm=sample.power_dbm,
+                    noise_floor_dbm=floor,
+                    now=now,
+                    dongle_id=dongle_id,
+                )
+
             state = self._active.get(sample.freq_hz)
             if state is None:
                 state = _ActiveState(

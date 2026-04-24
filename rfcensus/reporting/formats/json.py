@@ -9,16 +9,25 @@ from typing import Any
 
 from rfcensus.engine.session import SessionResult
 from rfcensus.reporting.privacy import scrub_emitter
-from rfcensus.storage.models import AnomalyRecord, EmitterRecord
+from rfcensus.storage.models import (
+    ActiveChannelRecord,
+    AnomalyRecord,
+    DetectionRecord,
+    EmitterRecord,
+)
 
 
 def render_json_report(
     result: SessionResult,
     emitters: list[EmitterRecord],
     anomalies: list[AnomalyRecord],
+    detections: list[DetectionRecord] | None = None,
+    active_channels: list[ActiveChannelRecord] | None = None,
     *,
     include_ids: bool = False,
 ) -> str:
+    detections = detections or []
+    active_channels = active_channels or []
     payload: dict[str, Any] = {
         "session": {
             "id": result.session_id,
@@ -59,6 +68,40 @@ def render_json_report(
                 "metadata": a.metadata,
             }
             for a in anomalies
+        ],
+        # v0.5.36: detections (previously present in the text report
+        # but missing from JSON) and active_channels (newly surfaced).
+        "detections": [
+            {
+                "id": d.id,
+                "detector": d.detector,
+                "technology": d.technology,
+                "freq_hz": d.freq_hz,
+                "bandwidth_hz": d.bandwidth_hz,
+                "confidence": d.confidence,
+                "evidence": d.evidence,
+                "hand_off_tools": list(d.hand_off_tools),
+                "detected_at": d.detected_at.isoformat(),
+                "metadata": d.metadata,
+            }
+            for d in detections
+        ],
+        "active_channels": [
+            {
+                "id": ch.id,
+                "freq_center_hz": ch.freq_center_hz,
+                "bandwidth_hz": ch.bandwidth_hz,
+                "peak_power_dbm": ch.peak_power_dbm,
+                "avg_power_dbm": ch.avg_power_dbm,
+                "noise_floor_dbm": ch.noise_floor_dbm,
+                "classification": ch.classification,
+                "persistence_ratio": ch.persistence_ratio,
+                "confidence": ch.confidence,
+                "first_seen": ch.first_seen.isoformat(),
+                "last_seen": ch.last_seen.isoformat(),
+                "metadata": ch.metadata,
+            }
+            for ch in active_channels
         ],
         "strategy_results": [
             {

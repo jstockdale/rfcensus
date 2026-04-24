@@ -77,17 +77,46 @@ class IQCaptureService:
             raise IQCaptureError(f"no dongle available: {exc}") from exc
 
         try:
-            if lease.dongle.driver == "rtlsdr":
-                return await self._capture_rtlsdr(
-                    lease, freq_hz, sample_rate, duration_s, gain
-                )
-            if lease.dongle.driver == "hackrf":
-                return await self._capture_hackrf(
-                    lease, freq_hz, sample_rate, duration_s, gain
-                )
-            raise IQCaptureError(f"unsupported driver: {lease.dongle.driver}")
+            return await self._dispatch(
+                lease, freq_hz, sample_rate, duration_s, gain
+            )
         finally:
             await self.broker.release(lease)
+
+    async def capture_with_lease(
+        self,
+        lease,
+        freq_hz: int,
+        sample_rate: int,
+        duration_s: float,
+        *,
+        gain: str = "auto",
+    ) -> IQCapture:
+        """v0.5.41: capture using an already-allocated lease.
+
+        For callers that have allocated their dongle through the
+        normal scheduler/broker path (e.g., the confirmation task,
+        which the wave planner schedules just like any primary task).
+        The lease is NOT released here — the caller owns lease
+        lifecycle. Multiple captures on the same lease are safe; each
+        one just re-tunes the already-open device.
+        """
+        return await self._dispatch(
+            lease, freq_hz, sample_rate, duration_s, gain
+        )
+
+    async def _dispatch(
+        self, lease, freq_hz, sample_rate, duration_s, gain
+    ) -> IQCapture:
+        if lease.dongle.driver == "rtlsdr":
+            return await self._capture_rtlsdr(
+                lease, freq_hz, sample_rate, duration_s, gain
+            )
+        if lease.dongle.driver == "hackrf":
+            return await self._capture_hackrf(
+                lease, freq_hz, sample_rate, duration_s, gain
+            )
+        raise IQCaptureError(f"unsupported driver: {lease.dongle.driver}")
 
     async def _capture_rtlsdr(
         self, lease, freq_hz, sample_rate, duration_s, gain

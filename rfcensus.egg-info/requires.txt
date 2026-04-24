@@ -3,6 +3,7 @@ pydantic>=2.5
 tomli-w>=1.0
 rich>=13.7
 numpy>=1.26
+scipy>=1.11
 psutil>=5.9
 
 [dev]

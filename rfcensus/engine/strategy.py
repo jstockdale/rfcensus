@@ -74,7 +74,13 @@ class Strategy(ABC):
     """Investigate one band."""
 
     @abstractmethod
-    async def execute(self, band: BandConfig, ctx: StrategyContext) -> StrategyResult:
+    async def execute(
+        self,
+        band: BandConfig,
+        ctx: StrategyContext,
+        *,
+        allowed_decoders: set[str] | None = None,
+    ) -> StrategyResult:
         ...
 
 
@@ -86,9 +92,15 @@ class Strategy(ABC):
 class DecoderOnlyStrategy(Strategy):
     """Run all suitable decoders on a band. No power scan."""
 
-    async def execute(self, band: BandConfig, ctx: StrategyContext) -> StrategyResult:
+    async def execute(
+        self,
+        band: BandConfig,
+        ctx: StrategyContext,
+        *,
+        allowed_decoders: set[str] | None = None,
+    ) -> StrategyResult:
         result = StrategyResult(band_id=band.id)
-        decoders = _pick_decoders(band, ctx)
+        decoders = _pick_decoders(band, ctx, allowed_decoders=allowed_decoders)
         if not decoders:
             result.errors.append(f"no usable decoders for {band.id}")
             return result
@@ -121,9 +133,15 @@ class DecoderOnlyStrategy(Strategy):
 class DecoderPrimaryStrategy(Strategy):
     """Decoders plus a power scan if a suitable backend is available."""
 
-    async def execute(self, band: BandConfig, ctx: StrategyContext) -> StrategyResult:
+    async def execute(
+        self,
+        band: BandConfig,
+        ctx: StrategyContext,
+        *,
+        allowed_decoders: set[str] | None = None,
+    ) -> StrategyResult:
         result = StrategyResult(band_id=band.id)
-        decoders = _pick_decoders(band, ctx)
+        decoders = _pick_decoders(band, ctx, allowed_decoders=allowed_decoders)
 
         tasks: list[asyncio.Task] = []
         for decoder in decoders:
@@ -175,7 +193,17 @@ class DecoderPrimaryStrategy(Strategy):
 class PowerPrimaryStrategy(Strategy):
     """Power scan the band; don't run decoders unless activity is found."""
 
-    async def execute(self, band: BandConfig, ctx: StrategyContext) -> StrategyResult:
+    async def execute(
+        self,
+        band: BandConfig,
+        ctx: StrategyContext,
+        *,
+        allowed_decoders: set[str] | None = None,
+    ) -> StrategyResult:
+        # allowed_decoders has no effect here — this strategy doesn't
+        # run decoders directly. Kept in the signature so the session
+        # loop can call `strategy.execute(band, ctx, allowed_decoders=...)`
+        # uniformly regardless of strategy type.
         result = StrategyResult(band_id=band.id)
         scan_result = await _run_power_scan(band, ctx)
         result.power_scan_performed = True
@@ -193,7 +221,15 @@ class PowerPrimaryStrategy(Strategy):
 class ExplorationStrategy(Strategy):
     """Power scan with no decoding. For bands we can't meaningfully decode yet."""
 
-    async def execute(self, band: BandConfig, ctx: StrategyContext) -> StrategyResult:
+    async def execute(
+        self,
+        band: BandConfig,
+        ctx: StrategyContext,
+        *,
+        allowed_decoders: set[str] | None = None,
+    ) -> StrategyResult:
+        # allowed_decoders unused (no decoders run). Kept for signature
+        # uniformity across Strategy subclasses.
         result = StrategyResult(band_id=band.id)
         scan_result = await _run_power_scan(band, ctx)
         result.power_scan_performed = True
@@ -207,12 +243,27 @@ class ExplorationStrategy(Strategy):
 # ------------------------------------------------------------
 
 
-def _pick_decoders(band: BandConfig, ctx: StrategyContext) -> list[DecoderBase]:
-    """Instantiate the decoders suitable for this band, filtered by suggested list and enablement."""
+def _pick_decoders(
+    band: BandConfig,
+    ctx: StrategyContext,
+    *,
+    allowed_decoders: set[str] | None = None,
+) -> list[DecoderBase]:
+    """Instantiate the decoders suitable for this band, filtered by
+    suggested list and enablement.
+
+    If `allowed_decoders` is provided (non-None), restrict the returned
+    decoders to exactly that set. This is used by the v0.5.35 plan-time
+    splitter to run only a subset of a band's decoders in a given wave
+    — the surplus decoders that couldn't fit are run by a separate
+    retry task in a later wave.
+    """
     suggested = set(band.suggested_decoders)
     chosen: list[DecoderBase] = []
     for name in ctx.decoder_registry.names():
         if suggested and name not in suggested:
+            continue
+        if allowed_decoders is not None and name not in allowed_decoders:
             continue
         cls = ctx.decoder_registry.get(name)
         if cls is None:
@@ -366,8 +417,26 @@ async def _run_power_scan(band: BandConfig, ctx: StrategyContext):
             continue
 
         backend = backend_cls()
-        analyzer = OccupancyAnalyzer(
+        # v0.5.38: instantiate a WideChannelAggregator alongside the
+        # OccupancyAnalyzer. The aggregator watches above-floor samples
+        # directly (bypassing the OccupancyAnalyzer's 1-second hold
+        # time that would otherwise miss short LoRa bursts), collects
+        # per-bin activity in a rolling window, and emits a
+        # WideChannelEvent when adjacent bins span a LoRa-standard
+        # template width (125/250/500 kHz). This is what lets the
+        # LoRa detector actually fire on Meshtastic traffic — without
+        # aggregation, narrow 25 kHz bin events never match the LoRa
+        # bandwidth heuristic. See spectrum/wide_channel_aggregator.py.
+        from rfcensus.spectrum.wide_channel_aggregator import (
+            WideChannelAggregator,
+        )
+        wide_aggregator = WideChannelAggregator(
             event_bus=ctx.event_bus, session_id=ctx.session_id
+        )
+        analyzer = OccupancyAnalyzer(
+            event_bus=ctx.event_bus,
+            session_id=ctx.session_id,
+            wide_aggregator=wide_aggregator,
         )
         spec = SpectrumSweepSpec(
             freq_low=band.freq_low,

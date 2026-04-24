@@ -14,6 +14,7 @@ from rfcensus.commands import export as export_cmd
 from rfcensus.commands import init as init_cmd
 from rfcensus.commands import inventory as inventory_cmd
 from rfcensus.commands import list as list_cmd
+from rfcensus.commands import monitor as monitor_cmd
 from rfcensus.commands import serialize as serialize_cmd
 from rfcensus.commands import setup as setup_cmd
 from rfcensus.commands import suggest as suggest_cmd
@@ -76,6 +77,7 @@ main.add_command(doctor_cmd.cli)
 main.add_command(list_cmd.cli)
 main.add_command(inventory_cmd.cli_inventory)
 main.add_command(inventory_cmd.cli_scan)
+main.add_command(monitor_cmd.monitor_cli)
 main.add_command(export_cmd.cli)
 main.add_command(diff_cmd.cli)
 main.add_command(baseline_cmd.cli)

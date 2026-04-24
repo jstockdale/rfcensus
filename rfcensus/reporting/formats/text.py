@@ -2,7 +2,8 @@
 
 Produces a human-readable summary of a completed session: emitters found,
 their classification + confidence, any anomalies, detections of known
-technologies, and warnings.
+technologies, active channels the power scan lit up without a decode,
+and warnings.
 """
 
 from __future__ import annotations
@@ -12,7 +13,30 @@ from datetime import datetime
 
 from rfcensus.engine.session import SessionResult
 from rfcensus.reporting.privacy import scrub_emitter
-from rfcensus.storage.models import AnomalyRecord, DetectionRecord, EmitterRecord
+from rfcensus.storage.models import (
+    ActiveChannelRecord,
+    AnomalyRecord,
+    DetectionRecord,
+    EmitterRecord,
+)
+
+
+# How many "mystery carrier" lines to print per band before truncating.
+# 10 is plenty to notice a pattern (e.g., "lots of activity at 915 that
+# we can't decode") without drowning the report in noise. Long scans in
+# busy RF environments easily generate 50-100 bins lit above threshold
+# per band — showing them all makes the section longer than the actual
+# emitter data, which buries the lede.
+_MAX_UNTRACKED_CHANNELS_PER_BAND = 10
+
+# Tolerance when matching an active channel against a known emitter
+# frequency. The channel's bandwidth already gives us one envelope but
+# we pad by this amount to handle cases where the power scan and the
+# decoder report frequencies with slightly different conventions (e.g.,
+# channel center vs actual carrier, or binning misalignment). 20 kHz
+# comfortably covers typical narrowband channels without over-collapsing
+# genuinely distinct carriers.
+_FREQ_MATCH_TOLERANCE_HZ = 20_000
 
 
 def render_text_report(
@@ -20,12 +44,14 @@ def render_text_report(
     emitters: list[EmitterRecord],
     anomalies: list[AnomalyRecord],
     detections: list[DetectionRecord] | None = None,
+    active_channels: list[ActiveChannelRecord] | None = None,
     *,
     include_ids: bool = False,
     site_name: str = "default",
     previously_known_ids: set[int] | None = None,
 ) -> str:
     detections = detections or []
+    active_channels = active_channels or []
     lines: list[str] = []
     lines.append("═" * 72)
     lines.append(f" rfcensus inventory report — session {result.session_id}")
@@ -135,6 +161,70 @@ def render_text_report(
                 f"  • {a.kind:20s} {freq}  {a.description or ''}"
             )
 
+    # Active channels without a decode — "mystery carriers"
+    # v0.5.36: these are frequencies where the power scan saw activity
+    # above the noise floor for long enough to be worth noticing, but
+    # no decoder produced output and no detector fired a classification.
+    # This closes the reporting gap users noticed where power_scan=yes
+    # produced no visible output. See _select_untracked_channels below
+    # for the exact filter.
+    untracked = _select_untracked_channels(active_channels, emitters, detections)
+    if untracked:
+        lines.append("")
+        lines.append("─" * 72)
+        lines.append(" Mystery carriers (active, but nothing decoded)")
+        lines.append("─" * 72)
+        lines.append(
+            "  Frequencies that lit up above the noise floor during "
+            "power scans but produced no decoder output and no detector"
+        )
+        lines.append(
+            "  classification. Persistent carriers here are the most "
+            "interesting — they suggest a signal that's present but"
+        )
+        lines.append(
+            "  that our current decoder/detector set doesn't recognize. "
+            f"(Showing top {_MAX_UNTRACKED_CHANNELS_PER_BAND} per band "
+            f"by persistence.)"
+        )
+
+        # Group by band. An active channel belongs to whichever band
+        # was actually scanned (covers its center freq). Bands come
+        # from the session plan so we only show ones the user knows
+        # were scanned; anything outside known bands is bucketed under
+        # "(outside scanned bands)" — unusual, but possible if a noisy
+        # off-band bin leaked into the scan.
+        bands_by_id = {}
+        for task in result.plan.tasks:
+            bands_by_id[task.band.id] = task.band
+
+        by_band: dict[str, list[ActiveChannelRecord]] = defaultdict(list)
+        for ch in untracked:
+            band_id = _band_id_for_freq(bands_by_id.values(), ch.freq_center_hz)
+            by_band[band_id or "(outside scanned bands)"].append(ch)
+
+        for band_id in sorted(by_band.keys()):
+            channels = by_band[band_id]
+            # Sort by persistence_ratio desc (most interesting first),
+            # falling back to peak power when persistence is None
+            channels.sort(
+                key=lambda c: (
+                    c.persistence_ratio if c.persistence_ratio is not None else -1,
+                    c.peak_power_dbm if c.peak_power_dbm is not None else -999,
+                ),
+                reverse=True,
+            )
+            lines.append("")
+            lines.append(f"  {band_id}  ({len(channels)} active)")
+            shown = channels[:_MAX_UNTRACKED_CHANNELS_PER_BAND]
+            for ch in shown:
+                lines.append("    " + _format_active_channel(ch))
+            if len(channels) > len(shown):
+                omitted = len(channels) - len(shown)
+                lines.append(
+                    f"    … {omitted} more in {band_id} not shown"
+                )
+
     # Strategy summary
     lines.append("")
     lines.append("─" * 72)
@@ -166,3 +256,81 @@ def _humanize_duration(seconds: float) -> str:
     if seconds < 3600:
         return f"{seconds / 60:.1f}m"
     return f"{seconds / 3600:.1f}h"
+
+
+def _select_untracked_channels(
+    active_channels: list[ActiveChannelRecord],
+    emitters: list[EmitterRecord],
+    detections: list[DetectionRecord],
+) -> list[ActiveChannelRecord]:
+    """Filter active_channels down to those NOT already surfaced as
+    an emitter (from a decoder) or a detection (from a detector).
+
+    Matching logic: a channel is "already covered" if any
+    emitter/detection has a frequency falling within the channel's
+    bandwidth (plus a small tolerance for binning/measurement drift).
+    We intentionally use a generous envelope because a power-scan bin
+    and a decoder-reported frequency are rarely pixel-perfect aligned
+    — but two widely separated carriers won't match by accident at the
+    tolerances used here.
+
+    Example: an Interlogix sensor decoded at 433.534 MHz and the
+    matching active-channel bin at 433.525 MHz with 10 kHz bandwidth
+    will match (433.525 ± 5 kHz + 20 kHz tolerance = 433.500–433.550
+    covers 433.534).
+    """
+    known_freqs: list[int] = []
+    for e in emitters:
+        if e.typical_freq_hz is not None:
+            known_freqs.append(int(e.typical_freq_hz))
+    for d in detections:
+        if d.freq_hz is not None:
+            known_freqs.append(int(d.freq_hz))
+
+    if not known_freqs:
+        return list(active_channels)
+
+    untracked: list[ActiveChannelRecord] = []
+    for ch in active_channels:
+        half_bw = ch.bandwidth_hz // 2
+        low = ch.freq_center_hz - half_bw - _FREQ_MATCH_TOLERANCE_HZ
+        high = ch.freq_center_hz + half_bw + _FREQ_MATCH_TOLERANCE_HZ
+        if any(low <= f <= high for f in known_freqs):
+            continue
+        untracked.append(ch)
+    return untracked
+
+
+def _band_id_for_freq(bands, freq_hz: int) -> str | None:
+    """Return the id of the (first) band whose span covers `freq_hz`,
+    or None if no band covers it. Used to group active channels by the
+    band the user actually scanned."""
+    for b in bands:
+        if b.freq_low <= freq_hz <= b.freq_high:
+            return b.id
+    return None
+
+
+def _format_active_channel(ch: ActiveChannelRecord) -> str:
+    """One-line formatted representation of an active channel for the
+    'Mystery carriers' section."""
+    freq_mhz = ch.freq_center_hz / 1_000_000
+    peak = (
+        f"{ch.peak_power_dbm:+.1f} dBm"
+        if ch.peak_power_dbm is not None else "? dBm"
+    )
+    floor = (
+        f"{ch.noise_floor_dbm:+.1f} dBm"
+        if ch.noise_floor_dbm is not None else "? dBm"
+    )
+    persist = (
+        f"{ch.persistence_ratio * 100:.0f}%"
+        if ch.persistence_ratio is not None else "?"
+    )
+    duration_s = max(0.0, (ch.last_seen - ch.first_seen).total_seconds())
+    classification = ch.classification or "unclassified"
+    return (
+        f"{freq_mhz:10.3f} MHz  peak={peak}  floor={floor}  "
+        f"persist={persist}  seen={_humanize_duration(duration_s)}  "
+        f"[{classification}]"
+    )

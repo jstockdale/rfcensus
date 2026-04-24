@@ -63,6 +63,54 @@ class ActiveChannelEvent(Event):
     confidence: float = 0.0
 
 
+@dataclass(slots=True)
+class WideChannelEvent(Event):
+    """A composite wide-bandwidth channel inferred from coherent
+    activity across multiple adjacent narrow bins.
+
+    Emitted by `WideChannelAggregator`. Distinct from `ActiveChannelEvent`
+    (which is always per-bin) because wide-bandwidth signals like LoRa
+    (125/250/500 kHz) never fit in a single power-scan bin and never
+    present as continuously-active single bins — a LoRa chirp sweeps
+    across the whole channel in under a symbol period, so at any instant
+    only a narrow slice is lit. Over a time window, all bins in the
+    channel show transient activity.
+
+    Consumers that care about wide-bandwidth signals (LoRa, Meshtastic,
+    FM broadcast, DMR voice traffic, etc.) subscribe to this event;
+    narrow-band detectors continue using `ActiveChannelEvent` as before.
+    """
+
+    dongle_id: str = ""
+    # Center frequency of the composite channel (midpoint of constituent
+    # bins' frequency span)
+    freq_center_hz: int = 0
+    # Composite bandwidth — matches the template that triggered emission
+    # (e.g., 125_000 for LoRa SF7/125kHz channels)
+    bandwidth_hz: int = 0
+    # Which target template this composite matched. Useful for
+    # downstream detectors that want to treat different widths
+    # differently (e.g., Meshtastic commonly uses 250 kHz).
+    matched_template_hz: int = 0
+    # How many of the constituent narrow bins saw activity within the
+    # aggregation window. Higher = more confident the signal really
+    # spanned the full template width vs. a handful of narrow carriers
+    # coincidentally near each other.
+    constituent_bin_count: int = 0
+    # What fraction of the template's frequency span was covered by
+    # active bins (0.0 to 1.0). We emit when this exceeds a threshold
+    # (typically 0.5) — partial coverage is expected because LoRa
+    # chirps don't linger on every bin simultaneously.
+    coverage_ratio: float = 0.0
+    # Power statistics across all constituent bins during the window
+    peak_power_dbm: float = 0.0
+    avg_power_dbm: float = 0.0
+    noise_floor_dbm: float = 0.0
+    # Time span during which this activity was observed
+    first_seen: datetime = field(default_factory=_utc_now)
+    last_seen: datetime = field(default_factory=_utc_now)
+
+
 # ------------------------------------------------------------
 # Decode / emitter events
 # ------------------------------------------------------------

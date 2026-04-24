@@ -33,6 +33,22 @@ class ScheduleTask:
     # host all its sidecars. At least 1 (the primary). Zero-valued tasks
     # are ones we couldn't assign at all.
     dongles_needed: int = 1
+    # Optional restriction on which decoders run for this task. None
+    # (default) means "run every decoder matched by band.suggested_decoders
+    # and the registry." A set restricts _pick_decoders to exactly those
+    # names. Used by the plan-time splitter to defer surplus exclusive
+    # decoders to later waves when the current wave's suitable-dongle
+    # pool can't host them all in parallel (v0.5.35). Set elements are
+    # decoder names (e.g. "multimon", "direwolf").
+    allowed_decoders: set[str] | None = None
+    # v0.5.41: if set, this task is a LoRa confirmation batch (not a
+    # normal strategy run). The session dispatch checks this field
+    # first and routes to run_batched_confirmation() when present,
+    # which allocates the suggested dongle exclusively, captures IQ
+    # at the cluster's center frequency, and classifies each task in
+    # the cluster via DDC + chirp analysis. The `band` field is
+    # synthesized to cover the cluster's span for antenna matching.
+    confirmation_cluster: object | None = None  # BatchedConfirmationTask
 
 
 def _estimate_dongle_needs(
@@ -279,6 +295,21 @@ class Scheduler:
                 waves.append(Wave(index=len(waves), tasks=[task]))
                 wave_reservations.append(new_reserved)
 
+        # v0.5.35: split multi-exclusive-decoder conflicts across waves.
+        # Some bands (like aprs_2m with direwolf + multimon both
+        # requesting exclusive dongle access) can't run all decoders
+        # in a single wave when the band's antenna-suitable dongle
+        # pool is smaller than the exclusive-decoder count. Rather
+        # than silently failing at runtime (the v0.5.34 behavior), we
+        # defer surplus decoders to later waves with spare capacity.
+        #
+        # This mutates `waves` and `wave_reservations` in place —
+        # may mark existing tasks with `allowed_decoders` and may
+        # append new waves for tasks that don't fit anywhere existing.
+        self._defer_surplus_exclusive_decoders(
+            waves, wave_reservations, usable
+        )
+
         cpus = os.cpu_count() or 4
         # Decoder processes are I/O-bound (USB reads + binary parsing),
         # not CPU-pegged. Capping at cpu_budget_fraction alone leaves
@@ -343,6 +374,241 @@ class Scheduler:
             warnings=warnings,
             unassigned=unassigned,
         )
+
+    def _defer_surplus_exclusive_decoders(
+        self,
+        waves: list[Wave],
+        wave_reservations: list[set[str]],
+        usable,
+    ) -> None:
+        """Split tasks whose band has more exclusive-access decoders
+        than the current wave's antenna-suitable dongle pool can host
+        concurrently. Surplus decoders are deferred to later waves with
+        spare capacity (most-spare first); a new wave is appended if
+        nothing existing has room.
+
+        Mutates `waves` and `wave_reservations` in place.
+
+        Without a decoder registry, we can't classify decoders as
+        exclusive vs shared, so we return without modifying the plan.
+        This matches the defensive posture of `_estimate_dongle_needs`.
+
+        The aprs_2m example that motivated this (v0.5.34 regression
+        notes): band suggests `["direwolf", "multimon"]`, both
+        exclusive-access. Only one 2m-capable dongle in the fleet. At
+        runtime the first to call broker.allocate() wins the dongle;
+        the loser logs "no dongle available" and silently does nothing.
+        With this splitter, direwolf stays in the band's primary wave
+        and multimon gets a retry task in a later wave where the same
+        dongle is free — both decoders run, sequentially rather than
+        concurrently.
+        """
+        if self.decoder_registry is None:
+            return
+
+        # Snapshot indices — we iterate a copy since we may append new
+        # waves mid-loop. Appended waves aren't re-examined: a new wave
+        # created for a deferred decoder runs exactly the one decoder
+        # we placed there, so there's nothing further to split.
+        n_initial_waves = len(waves)
+        for wave_idx in range(n_initial_waves):
+            wave = waves[wave_idx]
+            for task in list(wave.tasks):
+                self._maybe_split_task(
+                    task, wave_idx, waves, wave_reservations, usable
+                )
+
+    def _maybe_split_task(
+        self,
+        task: ScheduleTask,
+        wave_idx: int,
+        waves: list[Wave],
+        wave_reservations: list[set[str]],
+        usable,
+    ) -> None:
+        """Examine one task. If its band has a multi-exclusive-decoder
+        conflict with wave capacity, split it: constrain the original
+        task to a subset of decoders and create retry tasks for the
+        rest in later waves.
+        """
+        if task.suggested_dongle_id is None:
+            return
+        if task.allowed_decoders is not None:
+            # Already constrained — likely a retry task we created on
+            # an earlier pass. Don't split it again.
+            return
+
+        band = task.band
+        suggested = list(band.suggested_decoders)  # preserve user order
+
+        # Classify matched decoders. Preserve suggested_decoders
+        # ordering so "first listed = gets the primary dongle" is
+        # deterministic and reflects user intent.
+        exclusive_decoders: list[str] = []
+        shared_decoders: list[str] = []
+        registry_names = set(self.decoder_registry.names())
+        for name in suggested:
+            if name not in registry_names:
+                continue
+            cls = self.decoder_registry.get(name)
+            if cls is None:
+                continue
+            caps = cls.capabilities
+            if not any(
+                low <= band.freq_high and high >= band.freq_low
+                for low, high in caps.freq_ranges
+            ):
+                continue
+            if caps.access_mode == AccessMode.EXCLUSIVE:
+                exclusive_decoders.append(name)
+            else:
+                shared_decoders.append(name)
+
+        if len(exclusive_decoders) <= 1:
+            return  # no multi-exclusive conflict to worry about
+
+        # Capacity math for this wave.
+        #   suitable = all fleet dongles whose antenna covers the band
+        #   reserved_by_others = reservations in this wave EXCLUDING this task's primary
+        #   available_here = dongles this task could use (primary + free suitables in the wave)
+        #   capacity_here = count of exclusive decoders that fit in this wave
+        suitable = _suitable_dongle_ids(band, usable)
+        reserved_by_others = (
+            wave_reservations[wave_idx] - {task.suggested_dongle_id}
+        )
+        available_here = (
+            suitable - reserved_by_others
+        )  # includes task.suggested_dongle_id
+        capacity_here = len(available_here)
+
+        if capacity_here >= len(exclusive_decoders):
+            # All fit in this wave — reserve the additional dongles so
+            # other waves' planning doesn't later steal them. (The
+            # initial packing only reserved the primary + sidecar
+            # budget; it didn't know to reserve one slot per
+            # exclusive decoder.)
+            extras_to_reserve = len(exclusive_decoders) - 1
+            extra_pool = sorted(
+                available_here - {task.suggested_dongle_id}
+            )
+            for extra_id in extra_pool[:extras_to_reserve]:
+                wave_reservations[wave_idx].add(extra_id)
+            return
+
+        # Doesn't fit. Keep `capacity_here` exclusives here (by
+        # suggested_decoders order); defer the rest.
+        keep = exclusive_decoders[:capacity_here]
+        defer = exclusive_decoders[capacity_here:]
+
+        # Shared decoders always ride with the primary task — they
+        # don't block on dongle exclusivity and the band's shared
+        # protocols only need decoding once per scan.
+        task.allowed_decoders = set(keep) | set(shared_decoders)
+
+        # Reserve the extra dongles for the kept exclusives.
+        if len(keep) > 1:
+            extras_to_reserve = len(keep) - 1
+            extra_pool = sorted(
+                available_here - {task.suggested_dongle_id}
+            )
+            for extra_id in extra_pool[:extras_to_reserve]:
+                wave_reservations[wave_idx].add(extra_id)
+
+        task.notes.append(
+            f"plan split: {len(defer)} exclusive decoder(s) deferred "
+            f"to later wave(s) — {','.join(defer)} "
+            f"(wave {wave_idx} capacity={capacity_here}, "
+            f"needed={len(exclusive_decoders)})"
+        )
+
+        for decoder_name in defer:
+            self._place_deferred_decoder(
+                band=band,
+                decoder_name=decoder_name,
+                source_wave_idx=wave_idx,
+                waves=waves,
+                wave_reservations=wave_reservations,
+                suitable=suitable,
+                suggested_antenna_id=task.suggested_antenna_id,
+            )
+
+    def _place_deferred_decoder(
+        self,
+        *,
+        band: BandConfig,
+        decoder_name: str,
+        source_wave_idx: int,
+        waves: list[Wave],
+        wave_reservations: list[set[str]],
+        suitable: set[str],
+        suggested_antenna_id: str | None,
+    ) -> None:
+        """Find the best later wave for `decoder_name` to run on
+        `band`, or append a new wave. "Best" = most spare suitable
+        dongles (ties broken by earliest wave). If no later wave has
+        any suitable dongle free, append a new final wave.
+        """
+        best_idx: int | None = None
+        best_spare: int = -1
+        best_dongle: str | None = None
+
+        for idx in range(source_wave_idx + 1, len(waves)):
+            free = suitable - wave_reservations[idx]
+            if not free:
+                continue
+            spare = len(free)
+            if spare > best_spare:
+                best_spare = spare
+                best_idx = idx
+                # Deterministic pick from the free set
+                best_dongle = sorted(free)[0]
+
+        new_task = ScheduleTask(
+            band=band,
+            suggested_dongle_id=best_dongle,
+            suggested_antenna_id=suggested_antenna_id,
+            dongles_needed=1,
+            allowed_decoders={decoder_name},
+            notes=[
+                f"plan retry: {decoder_name}@{band.id} deferred from "
+                f"wave {source_wave_idx}"
+            ],
+        )
+
+        if best_idx is None:
+            # No later wave has any suitable dongle free. Append a new
+            # wave. Pick any suitable dongle to assign; if the fleet
+            # has none at all (pathological), bail without placing.
+            if not suitable:
+                log.warning(
+                    "cannot place deferred decoder %s@%s: no suitable "
+                    "dongle in fleet",
+                    decoder_name,
+                    band.id,
+                )
+                return
+            default_dongle = sorted(suitable)[0]
+            new_task.suggested_dongle_id = default_dongle
+            new_wave = Wave(index=len(waves), tasks=[new_task])
+            waves.append(new_wave)
+            wave_reservations.append({default_dongle})
+            log.info(
+                "plan: appended wave %d for deferred %s@%s (no earlier "
+                "wave had spare capacity)",
+                new_wave.index,
+                decoder_name,
+                band.id,
+            )
+        else:
+            waves[best_idx].tasks.append(new_task)
+            wave_reservations[best_idx].add(best_dongle)  # type: ignore[arg-type]
+            log.info(
+                "plan: placed deferred %s@%s in wave %d (spare=%d)",
+                decoder_name,
+                band.id,
+                best_idx,
+                best_spare,
+            )
 
 
 def scored_tasks_iter(waves):

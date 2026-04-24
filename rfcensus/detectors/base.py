@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from rfcensus.events import ActiveChannelEvent, EventBus
+from rfcensus.events import ActiveChannelEvent, EventBus, WideChannelEvent
 
 if TYPE_CHECKING:
     from rfcensus.spectrum.iq_capture import IQCaptureService
@@ -33,6 +33,15 @@ class DetectorCapabilities:
     relevant_freq_ranges: tuple[tuple[int, int], ...]
     consumes_active_channels: bool = True
     consumes_power_samples: bool = False
+    # v0.5.38: opt-in to WideChannelEvents from WideChannelAggregator.
+    # Detectors for wide-bandwidth signals (LoRa/Meshtastic at 125–500
+    # kHz, DMR voice bursts, FM broadcast, etc.) set this True so they
+    # receive already-aggregated wide-channel matches. Detectors that
+    # only care about narrow-bin activity (rtl_433-style 10–25 kHz
+    # carriers) leave this False. Orthogonal to `consumes_active_channels`:
+    # a detector can consume both, consuming wide channels for primary
+    # detection and narrow channels as secondary evidence.
+    consumes_wide_channels: bool = False
     # If true, the detector will be given access to IQ capture on attach.
     # Detectors that set this should gracefully handle the service being None
     # (no IQ-capable dongle available) or captures failing.
@@ -87,14 +96,26 @@ class DetectorBase(ABC):
             self._iq_service = iq_service
         if self.capabilities.consumes_active_channels:
             bus.subscribe(ActiveChannelEvent, self._handle_channel)
+        if self.capabilities.consumes_wide_channels:
+            bus.subscribe(WideChannelEvent, self._handle_wide_channel)
 
     async def _handle_channel(self, event: ActiveChannelEvent) -> None:
         if not self.capabilities.covers(event.freq_center_hz):
             return
         await self.on_active_channel(event)
 
+    async def _handle_wide_channel(self, event: WideChannelEvent) -> None:
+        if not self.capabilities.covers(event.freq_center_hz):
+            return
+        await self.on_wide_channel(event)
+
     async def on_active_channel(self, event: ActiveChannelEvent) -> None:
         """Override to process active channel events in your detector's band."""
+
+    async def on_wide_channel(self, event: WideChannelEvent) -> None:
+        """Override to process wide-channel composite events in your
+        detector's band. Called only for detectors with
+        `consumes_wide_channels=True` in capabilities."""
 
     def check_available(self) -> DetectorAvailability:
         return DetectorAvailability(name=self.name, available=True)

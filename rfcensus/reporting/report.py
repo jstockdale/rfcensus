@@ -1,7 +1,7 @@
 """Report builder.
 
 Ties together session results, database queries for emitters / anomalies
-/ detections, privacy scrubbing, and format rendering.
+/ detections / active channels, privacy scrubbing, and format rendering.
 """
 
 from __future__ import annotations
@@ -10,7 +10,12 @@ from rfcensus.engine.session import SessionResult
 from rfcensus.reporting.formats.json import render_json_report
 from rfcensus.reporting.formats.text import render_text_report
 from rfcensus.storage.db import Database
-from rfcensus.storage.repositories import AnomalyRepo, DetectionRepo, EmitterRepo
+from rfcensus.storage.repositories import (
+    ActiveChannelRepo,
+    AnomalyRepo,
+    DetectionRepo,
+    EmitterRepo,
+)
 
 
 class ReportBuilder:
@@ -21,6 +26,11 @@ class ReportBuilder:
         self.emitter_repo = EmitterRepo(db)
         self.anomaly_repo = AnomalyRepo(db)
         self.detection_repo = DetectionRepo(db)
+        # v0.5.36: surface active channels (frequencies that lit up
+        # during power scans but produced no decoder output) in the
+        # report so users see the "mystery carriers" — activity
+        # worth investigating that their current decoder set misses.
+        self.active_channel_repo = ActiveChannelRepo(db)
 
     async def render(
         self,
@@ -33,6 +43,9 @@ class ReportBuilder:
         emitters = await self.emitter_repo.for_session(result.session_id)
         anomalies = await self.anomaly_repo.for_session(result.session_id)
         detections = await self.detection_repo.for_session(result.session_id)
+        active_channels = await self.active_channel_repo.for_session(
+            result.session_id
+        )
 
         previously_known_ids: set[int] = {
             e.id for e in emitters
@@ -41,11 +54,11 @@ class ReportBuilder:
 
         if fmt == "json":
             return render_json_report(
-                result, emitters, anomalies, detections,
+                result, emitters, anomalies, detections, active_channels,
                 include_ids=include_ids,
             )
         return render_text_report(
-            result, emitters, anomalies, detections,
+            result, emitters, anomalies, detections, active_channels,
             include_ids=include_ids,
             site_name=site_name,
             previously_known_ids=previously_known_ids,

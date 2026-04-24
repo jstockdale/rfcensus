@@ -12,6 +12,7 @@ from rfcensus.events.events import (
     HardwareEvent,
     PowerSampleEvent,
     SessionEvent,
+    WideChannelEvent,
 )
 
 __all__ = [
@@ -27,4 +28,5 @@ __all__ = [
     "PowerSampleEvent",
     "SessionEvent",
     "Subscription",
+    "WideChannelEvent",
 ]

@@ -133,15 +133,29 @@ class TestDecoderPrimaryStillCountsCorrectly:
 
 class TestUserScenarioCollapsesTo5Waves:
     def test_full_plan_stays_5_waves_with_17_bands(self):
-        """User's real fleet + builtin bands should plan into 5 waves
-        (VHF serialization floor), not 7 as in v0.5.18.
+        """User's real fleet + builtin bands plans into 6 waves after
+        v0.5.35 (VHF serialization floor = 5 + 1 wave for multimon's
+        deferred aprs_2m task).
 
-        With v0.5.32's addition of 915_ism_r900 as a second pass at
-        912.6 MHz, the plan grew from 16 tasks to 17 — but wave count
-        stays at 5 because the new task slots into existing idle time
-        on the second whip_915 dongle. This is the expected behavior
-        that motivated Option A (separate band, not intrinsic
-        multi-pass): free coverage from idle fleet capacity.
+        v0.5.19 intent: 5 waves — VHF serialization floor from shared
+        156-MHz-antenna dongle.
+        v0.5.32: +915_ism_r900 added (17 tasks, still 5 waves — slots
+        into the second whip_915 dongle's idle slot).
+        v0.5.35: plan now surfaces the aprs_2m multi-exclusive-decoder
+        conflict. aprs_2m suggests both direwolf and multimon (both
+        exclusive). Only one 2m-suitable dongle in the fleet, so they
+        can't run in parallel. The scheduler defers multimon to a
+        later wave and since waves 0-4 all have rtlsdr-07262454 in
+        use (it's the VHF workhorse), multimon ends up in a new
+        wave 5. This surfaces what was silently a failed allocation
+        in v0.5.32 — both decoders now actually run, sequentially.
+
+        The 5-wave count CAN be restored by either (a) dropping
+        multimon from aprs_2m's suggested_decoders (direwolf is the
+        better APRS decoder anyway), or (b) converting multimon to
+        shared-access via rtl_tcp + fm_bridge (planned v0.5.36).
+        For now, this test documents the plan-time surfacing of the
+        conflict.
         """
         from rfcensus.config.loader import load_config
         from rfcensus.decoders.registry import get_registry
@@ -193,15 +207,34 @@ class TestUserScenarioCollapsesTo5Waves:
             config, broker, decoder_registry=get_registry(),
         ).plan(config.enabled_bands())
 
-        # Wave count is the key invariant — it determines wall-time.
-        # VHF bands (marine_vhf, nws_weather, ais, business_vhf,
-        # aprs_2m) all need the same dongle (whip_156) and serialize
-        # into 5 waves. Adding more bands at other frequencies
-        # should slot into idle time without growing wave count.
+        # v0.5.37: 5 waves. multimon and direwolf are now BOTH shared
+        # (v0.5.37 moved them off exclusive rtl_fm to shared rtl_tcp
+        # via the fm_bridge), so they coexist on one aprs_2m task
+        # rather than needing the scheduler to split it.
+        #
+        # Prior-version context:
+        #   v0.5.19: 5 waves (but with an exclusive conflict that meant
+        #            one of multimon/direwolf silently lost)
+        #   v0.5.35: 6 waves (splitter keeps both running but across
+        #            waves — one as a deferred retry task)
+        #   v0.5.37: 5 waves (shared access makes the split unneeded)
         assert len(plan.waves) == 5, (
-            f"expected 5 waves (VHF serialization floor), got "
-            f"{len(plan.waves)}. New bands should fit in idle "
-            f"dongle time, not extend the plan."
+            f"expected 5 waves (v0.5.37 shared-access aprs_2m), got "
+            f"{len(plan.waves)}. See v0.5.37 release note: multimon "
+            f"and direwolf now use fm_bridge + rtl_tcp for shared "
+            f"access so they coexist without the scheduler splitter."
         )
-        # 17 tasks = 16 original + 915_ism_r900 added in v0.5.32
+        # 17 tasks = 17 original bands. No splitter-added tasks since
+        # the multi-exclusive conflict no longer exists.
         assert len(plan.tasks) == 17
+
+        # aprs_2m should have exactly ONE task, NOT split. allowed_decoders
+        # stays None (i.e. all matching decoders allowed to run together).
+        aprs_tasks = [t for t in plan.tasks if t.band.id == "aprs_2m"]
+        assert len(aprs_tasks) == 1, (
+            f"expected 1 aprs_2m task (shared), got {len(aprs_tasks)}"
+        )
+        assert aprs_tasks[0].allowed_decoders is None, (
+            f"aprs_2m task should allow all decoders (shared mode); "
+            f"got allowed_decoders={aprs_tasks[0].allowed_decoders}"
+        )

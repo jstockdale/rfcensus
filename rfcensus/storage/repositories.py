@@ -22,6 +22,9 @@ from rfcensus.storage.models import (
     json_dumps,
     json_loads,
 )
+from rfcensus.utils.logging import get_logger
+
+log = get_logger(__name__)
 
 
 def _iso(dt: datetime) -> str:
@@ -676,6 +679,58 @@ class DetectionRepo:
             (session_id,),
         )
         return [_row_to_detection(r) for r in rows]
+
+    async def update_metadata(
+        self,
+        *,
+        detection_id: int,
+        **fields,
+    ) -> None:
+        """v0.5.41: merge fields into an existing detection's metadata
+        JSON blob. Used by the confirmation task runner to backfill
+        IQ-derived fields (estimated_sf, variant, iq_confirmed, etc.)
+        into a row that was inserted earlier during discovery.
+
+        Read-modify-write: loads current metadata, merges the new
+        fields, writes back. Also bumps the row's `confidence` upward
+        by a small amount when iq_confirmed=True so reports can
+        surface confirmed detections above unconfirmed ones.
+
+        Not atomic across concurrent updaters; in practice each
+        detection_id is confirmed exactly once per session.
+        """
+        row = await self.db.fetchone(
+            "SELECT metadata, confidence FROM detections WHERE id = ?",
+            (detection_id,),
+        )
+        if row is None:
+            log.warning(
+                "update_metadata: detection_id=%d not found", detection_id
+            )
+            return
+
+        current_metadata = {}
+        if row["metadata"]:
+            try:
+                import json
+                current_metadata = json.loads(row["metadata"])
+                if not isinstance(current_metadata, dict):
+                    current_metadata = {}
+            except Exception:
+                current_metadata = {}
+
+        # Merge new fields into the metadata blob
+        current_metadata.update(fields)
+
+        # Confidence bump when confirmation succeeded
+        new_confidence = row["confidence"]
+        if fields.get("iq_confirmed") is True:
+            new_confidence = min(1.0, float(new_confidence) + 0.15)
+
+        await self.db.execute(
+            "UPDATE detections SET metadata = ?, confidence = ? WHERE id = ?",
+            (json_dumps(current_metadata), new_confidence, detection_id),
+        )
 
     async def all(self, technology: str | None = None) -> list[DetectionRecord]:
         if technology:

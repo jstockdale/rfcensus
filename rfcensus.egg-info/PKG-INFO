@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: rfcensus
-Version: 0.5.34
+Version: 0.5.41
 Summary: A site survey and inventory tool for the RF environment around you
 Author: John Stockdale
 License: BSD-3-Clause
@@ -28,6 +28,7 @@ Requires-Dist: pydantic>=2.5
 Requires-Dist: tomli-w>=1.0
 Requires-Dist: rich>=13.7
 Requires-Dist: numpy>=1.26
+Requires-Dist: scipy>=1.11
 Requires-Dist: psutil>=5.9
 Provides-Extra: dev
 Requires-Dist: pytest>=7.4; extra == "dev"

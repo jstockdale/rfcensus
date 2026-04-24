@@ -112,4 +112,4 @@ and does not link against them, so the BSD license applies to rfcensus itself.
 
 ## Project
 
-rfcensus is a project by @jstockdale and Off by One.
+rfcensus is an Off by One project.

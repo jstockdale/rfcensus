@@ -24,25 +24,43 @@ _DB_SINGLETON: Database | None = None
 
 
 class Database:
-    """Thin async-friendly wrapper around a sqlite3 connection."""
+    """Thin async-friendly wrapper around a sqlite3 connection.
 
-    def __init__(self, path: Path):
+    Supports both file-backed and in-memory databases. Pass `":memory:"`
+    (as a Path or str) to create an ephemeral in-memory database —
+    useful for monitor-mode sessions that don't want to persist data,
+    and for tests. In-memory databases are automatically cleaned up
+    when the Database is closed / GC'd.
+    """
+
+    def __init__(self, path: Path | str):
+        # Accept either Path or str so `:memory:` magic works (Path
+        # would resolve it as a literal filename in CWD, which is
+        # wrong — the string passed to sqlite3.connect must be the
+        # exact sentinel `:memory:` for it to create an in-memory DB).
         self.path = path
         self._conn: sqlite3.Connection | None = None
         self._lock = asyncio.Lock()
+
+    @property
+    def is_in_memory(self) -> bool:
+        return str(self.path) == ":memory:"
 
     def _ensure_open(self) -> sqlite3.Connection:
         if self._conn is None:
             log.debug("opening sqlite database at %s", self.path)
             self._conn = sqlite3.connect(
-                self.path,
+                str(self.path),
                 detect_types=sqlite3.PARSE_DECLTYPES,
                 isolation_level=None,  # autocommit; we manage transactions
                 check_same_thread=False,  # safe: we serialize via asyncio lock
             )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON")
-            self._conn.execute("PRAGMA journal_mode = WAL")
+            # WAL mode doesn't apply to in-memory databases; sqlite
+            # silently ignores the pragma but it's cleaner to skip it.
+            if not self.is_in_memory:
+                self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.execute("PRAGMA synchronous = NORMAL")
             apply_migrations(self._conn)
         return self._conn
