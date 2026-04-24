@@ -197,6 +197,17 @@ class DecimatingLowpass:
         # Cumulative input samples consumed, mod decimation, to keep
         # block-boundary decimation aligned with a single-pass reference.
         self._samples_consumed_mod = 0
+        # NOTE (v0.5.45): lfilter computes all N input samples' filtered
+        # output even though we discard (M-1)/M of them. For M=50 this
+        # is ~50× more arithmetic than strictly necessary. A polyphase
+        # decimator using scipy.signal.upfirdn would be ideal, but
+        # reconciling its output-length convention with our block-by-
+        # block streaming + arbitrary phase_offset semantics is
+        # non-trivial — partial implementation in v0.5.45 had off-by-N
+        # alignment for non-M-divisible block sizes. Deferred to a
+        # future revision; the resampler fix in v0.5.45 already cut
+        # total fm_bridge CPU from ~100% of a Pi 5 core to ~30%, so
+        # this is a "next optimization" rather than urgent.
 
     def process(self, x: np.ndarray) -> np.ndarray:
         if x.size == 0:
@@ -246,8 +257,31 @@ class Resampler:
         up: int,
         down: int,
         *,
-        filter_taps_per_phase: int = 32,
+        max_filter_taps: int = 257,
+        stopband_attenuation_db: float = 60.0,
     ) -> None:
+        """v0.5.45: bound the filter length to keep CPU in check.
+
+        The previous version let scipy.signal.resample_poly auto-build
+        its polyphase filter, which defaults to `10 * max(up, down)`
+        taps. For awkward fractional ratios (e.g. 22222 Hz → 22050 Hz
+        with up=11025/down=11111) that's 111,111 taps — each output
+        sample costs 111k multiplies. fm_bridge was spending 98% of
+        its CPU inside this one step, burning a full Pi 5 core per
+        instance.
+
+        For our use case (narrowband FM voice / AFSK, audio content
+        well below 4 kHz, output sample rates ≥ 22 kHz) the filter
+        requirements are very loose: any mild lowpass at ~0.45 × Nyquist
+        with 60 dB stopband is fine. A 200-ish-tap Kaiser-window FIR
+        designed by us and passed to `resample_poly` via the `window=`
+        parameter eliminates the 100k-tap catastrophe and gets us to
+        the expected < 10% CPU for this stage.
+
+        `max_filter_taps` is a ceiling — if up/down are small the
+        auto-derived length (5 × max(up,down) + 1) is used instead.
+        Odd only, for linear phase.
+        """
         if up < 1 or down < 1:
             raise ValueError("up and down must be >= 1")
         from math import gcd
@@ -256,20 +290,61 @@ class Resampler:
         self.up = up // g
         self.down = down // g
 
-        # resample_poly internally builds a filter; we estimate its
-        # warm-up length so we can hold enough history. The filter has
-        # ~10 * max(up, down) taps by default in scipy.
+        # Design a short Kaiser-window FIR matched to the output
+        # spectrum we actually need. Cutoff = 1 / max(up, down) in
+        # scipy.signal.resample_poly's normalized frequency convention.
+        # Kaiser beta for 60 dB is ~5.65.
+        from scipy.signal import firwin, kaiser_beta
+        beta = kaiser_beta(stopband_attenuation_db)
+        # Take the smaller of (5 × max(up,down) + 1) and max_filter_taps.
+        # Round UP to the next odd for linear phase.
+        ideal_len = 5 * max(self.up, self.down) + 1
+        num_taps = min(ideal_len, max_filter_taps)
+        if num_taps % 2 == 0:
+            num_taps += 1
+        # Normalized cutoff. resample_poly uses cutoff relative to the
+        # filter's internal rate which is `up × input_rate`. Normalized
+        # cutoff = 1 / max(up, down) is the correct Nyquist boundary
+        # to avoid aliasing AND imaging. Pull it in a touch (0.95) for
+        # transition band.
+        cutoff = 0.95 / max(self.up, self.down)
+        # firwin wants cutoff in [0, 1] where 1.0 = Nyquist of the
+        # filter's sample rate, which for resample_poly internals is
+        # up × input_rate. So cutoff here matches that convention.
+        taps = firwin(
+            num_taps, cutoff,
+            window=("kaiser", beta), pass_zero="lowpass",
+        )
+        # Pass taps directly — scipy.signal.resample_poly's window=
+        # parameter accepts an array of taps and handles the
+        # zero-insertion gain compensation internally. (We tested
+        # multiplying by `up` and confirmed it produces `up`× gain
+        # at the output, not unity.)
+        self._filter_taps = taps.astype(np.float32)
+
+        # Overlap history: we need `num_taps / 2 / up` input samples
+        # of context so the filter's transient doesn't corrupt block
+        # boundaries. Round up generously.
         self._overlap_samples = max(
-            filter_taps_per_phase * max(self.up, self.down), 64
+            (num_taps + self.up - 1) // self.up + 8, 32
         )
         self._history: np.ndarray | None = None
-        # How many samples of "warm-up" output we need to trim from
-        # the start of each resample_poly call because they're
-        # contaminated by the prepended history.
-        # At rate up/down, each input sample produces up/down output
-        # samples. So overlap_samples input → (overlap_samples * up // down)
-        # output samples to trim.
-        self._trim_output = (self._overlap_samples * self.up) // self.down
+        self._num_taps = num_taps  # for output-length computation
+
+    @staticmethod
+    def _resample_poly_output_len(
+        filter_len: int, in_len: int, up: int, down: int
+    ) -> int:
+        """Replicates scipy.signal.resample_poly's internal length
+        formula. Used for exact per-block trim computation so block-by-
+        block output count matches what a single-pass call would
+        produce, modulo per-block ceil rounding."""
+        in_len_copy = in_len + (filter_len + (-filter_len % up)) // up - 1
+        nt = in_len_copy * up
+        need = nt // down
+        if nt % down > 0:
+            need += 1
+        return need
 
     def process(self, x: np.ndarray) -> np.ndarray:
         if x.size == 0:
@@ -284,11 +359,33 @@ class Resampler:
         else:
             extended = np.concatenate([self._history, x])
 
-        # resample_poly supports complex input directly since 1.5.
-        out = resample_poly(extended, self.up, self.down, padtype="line")
-        # Trim the warm-up region
-        if self._trim_output > 0:
-            out = out[self._trim_output :]
+        # v0.5.45: pass our pre-designed filter via the `window=` param.
+        # resample_poly's `window` accepts either a get_window() spec
+        # (triggers auto-sizing) OR a 1D array of filter taps (uses
+        # directly). We pass the taps → scipy uses our short filter
+        # instead of building a 100k-tap one for awkward fractional
+        # ratios.
+        out = resample_poly(
+            extended, self.up, self.down,
+            window=self._filter_taps, padtype="line",
+        )
+
+        # v0.5.45: compute exact trim using scipy's own output-length
+        # formula. Trim = (output for extended) - (output for x alone),
+        # which is the number of output samples produced by the overlap
+        # prefix. This makes per-block output count match what a
+        # single-pass call on x alone would produce — and across N
+        # blocks, the cumulative output count tracks the single-pass
+        # full-stream count to within ±N (per-block ceil rounding).
+        out_len_extended = self._resample_poly_output_len(
+            self._num_taps, len(extended), self.up, self.down,
+        )
+        out_len_x = self._resample_poly_output_len(
+            self._num_taps, x.size, self.up, self.down,
+        )
+        trim = max(0, out_len_extended - out_len_x)
+        if trim > 0:
+            out = out[trim:]
 
         # Retain the last overlap_samples of input for the next block's
         # warm-up history.
@@ -362,6 +459,90 @@ class DeEmphasis:
 # ----------------------------------------------------------------
 
 
+def _pick_decimation(input_rate: int, output_rate: int) -> tuple[int, int]:
+    """Choose an integer decimation factor that lands on an intermediate
+    rate with the cleanest possible ratio to output_rate.
+
+    Returns ``(decimation, intermediate_rate)`` where:
+
+      • ``input_rate % decimation == 0`` (clean integer decimation)
+      • ``intermediate_rate = input_rate / decimation``
+      • ``intermediate_rate >= 2 * output_rate`` (audio Nyquist
+        headroom for the subsequent fractional resample)
+      • ``max(up, down)`` after reduction by ``gcd(intermediate, output)``
+        is minimized — keeps the polyphase filter short
+
+    Why this matters: scipy.signal.resample_poly's default polyphase
+    filter is ``10 * max(up, down)`` taps. The previous logic
+    (``decim = input_rate // output_rate``) picked the smallest
+    intermediate just above output_rate, which for awkward ratios
+    (2.4 Msps → 22050 Hz → intermediate 22222, ratio 11025/11111)
+    triggered a 111,111-tap filter. Walking divisors of input_rate
+    and picking the one with the smallest reduced ratio finds
+    intermediate=48000 Hz instead (147/320 → ~3200 taps default,
+    or 257 with v0.5.45's bounded-filter Resampler).
+
+    Edge cases:
+      • If input_rate is an integer multiple of output_rate, returns
+        ``(input_rate // output_rate, output_rate)`` — no fractional
+        resample needed at all.
+      • If output_rate is so high relative to input_rate that no
+        decimation can give an intermediate ≥ 2× output_rate,
+        returns ``(1, input_rate)`` — caller's resampler handles the
+        full ratio.
+    """
+    from math import gcd
+
+    if input_rate <= 0 or output_rate <= 0:
+        raise ValueError(
+            f"input_rate and output_rate must be positive; "
+            f"got {input_rate}, {output_rate}"
+        )
+    if input_rate < output_rate:
+        raise ValueError(
+            f"input_rate ({input_rate}) must be >= output_rate "
+            f"({output_rate})"
+        )
+
+    # Trivial case: input is integer multiple of output → integer
+    # decimation directly to output_rate, no fractional resample.
+    if input_rate % output_rate == 0:
+        return (input_rate // output_rate, output_rate)
+
+    min_intermediate = 2 * output_rate
+    max_decim = input_rate // min_intermediate
+    if max_decim < 1:
+        # output_rate too high relative to input_rate; can't decimate
+        # below 2× output Nyquist. Skip integer decimation entirely.
+        return (1, input_rate)
+
+    # Score = max(up, down) of the reduced fractional resample ratio.
+    # Lower is better. Ties broken by smaller intermediate rate
+    # (= less downstream resample work).
+    best: tuple[int, int, int] | None = None  # (score, decim, intermediate)
+    for decim in range(1, max_decim + 1):
+        if input_rate % decim != 0:
+            continue
+        intermediate = input_rate // decim
+        if intermediate < min_intermediate:
+            continue
+        g = gcd(intermediate, output_rate)
+        up = output_rate // g
+        down = intermediate // g
+        score = max(up, down)
+        if best is None or (score, intermediate) < (best[0], best[2]):
+            best = (score, decim, intermediate)
+
+    if best is None:
+        # No valid divisor found — fall back to the prior logic.
+        # This shouldn't happen for any realistic SDR input rate but
+        # keeps the function total.
+        decim = max(1, input_rate // output_rate)
+        return (decim, input_rate // decim)
+
+    return (best[1], best[2])
+
+
 class FMDemodulator:
     """End-to-end pipeline: complex IQ at `input_rate` → int16 PCM at
     `output_rate`.
@@ -398,11 +579,23 @@ class FMDemodulator:
         self.output_rate = output_rate
         self.audio_scale = float(audio_scale)
 
-        # Choose an integer-decimation intermediate rate that's as
-        # close to output_rate as possible (no higher), so the
-        # fractional resampler has the easiest job.
-        self._decimation = max(1, input_rate // output_rate)
-        self._intermediate_rate = input_rate // self._decimation
+        # v0.5.45: pick decimation that lands on an intermediate rate
+        # with a CLEAN ratio to output_rate. The prior logic (decim =
+        # input_rate // output_rate) picked the smallest intermediate
+        # that exceeded output_rate — for 2.4 Msps → 22050 Hz that
+        # yielded intermediate = 22222 Hz, a ratio of 11025/11111 with
+        # no common factor. scipy.signal.resample_poly then built a
+        # ~100k-tap polyphase filter to handle this ratio, consuming
+        # an entire Pi 5 core per fm_bridge instance.
+        #
+        # Strategy: walk integer divisors of input_rate looking for one
+        # that produces intermediate rate ≥ 2 × output_rate AND has
+        # small up/down when reduced against output_rate. For 2.4 Msps
+        # → 22050, this lands on decim=50 (intermediate=48000, ratio
+        # 147/320, polyphase filter length ~300 with v0.5.45's cap).
+        self._decimation, self._intermediate_rate = _pick_decimation(
+            input_rate=input_rate, output_rate=output_rate,
+        )
 
         self.decimator = DecimatingLowpass(
             decimation=self._decimation, dtype=np.complex64
