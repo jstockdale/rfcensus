@@ -540,15 +540,19 @@ def digital_downconvert(
     target_output_rate = max(4 * target_bw_hz, source_rate // 32)
     decim = max(1, source_rate // target_output_rate)
     if decim == 1:
-        # No decimation needed — apply a cheap low-pass only. Use the
-        # existing DecimatingLowpass with decimation=1.
-        lp = DecimatingLowpass(
-            input_rate=source_rate,
-            decimation=1,
-            cutoff=target_bw_hz,
-            numtaps=65,
-        )
-        return lp.process(shifted).astype(np.complex64)
+        # No decimation needed — apply a cheap low-pass only. Use
+        # scipy.signal.firwin + lfilter directly (the DecimatingLowpass
+        # class requires decimation>=1 but expects different args; we
+        # don't need its state management here since we're called once
+        # per capture, not streamed).
+        from scipy.signal import firwin, lfilter
+        # Cutoff as fraction of Nyquist. Normalize target bandwidth
+        # by the half-rate.
+        nyquist = source_rate / 2.0
+        cutoff_norm = min(0.9, target_bw_hz / nyquist)
+        taps = firwin(65, cutoff_norm)
+        filtered = lfilter(taps, 1.0, shifted)
+        return filtered.astype(np.complex64)
 
     # For real decimation use scipy.signal.decimate which chains
     # Chebyshev/FIR anti-alias + downsample in one call. Complex

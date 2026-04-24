@@ -41,7 +41,9 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from rfcensus.engine.confirmation_queue import BatchedConfirmationTask
+from rfcensus.spectrum.channel_plans import match_channel
 from rfcensus.spectrum.chirp_analysis import analyze_chirps
+from rfcensus.spectrum.in_window_survey import survey_iq_window
 from rfcensus.spectrum.iq_capture import IQCaptureError, IQCaptureService
 from rfcensus.tools.dsp import digital_downconvert
 from rfcensus.utils.logging import get_logger
@@ -71,6 +73,7 @@ async def run_batched_confirmation(
     session_id: int,
     subcapture_duration_s: float = DEFAULT_SUBCAPTURE_DURATION_S,
     progress_cb: "callable | None" = None,
+    survey_cb: "callable | None" = None,
 ) -> set[int]:
     """Execute one batched confirmation cluster. Returns the set of
     detection_ids that were successfully confirmed.
@@ -83,6 +86,12 @@ async def run_batched_confirmation(
     `progress_cb`, if provided, is called with short text updates
     suitable for emitting to the user's terminal (one call per chirp
     detected, plus start/end).
+
+    `survey_cb`, if provided, is called once per in-window survey
+    hit (a LoRa-like signal found in the wideband IQ that wasn't
+    in the original cluster — typically a sparse channel that the
+    bin-based aggregator missed). Caller synthesizes a
+    DetectionEvent. Signature: survey_cb(SurveyHit) -> None.
     """
     from rfcensus.detectors.builtin.lora import (
         _estimate_sf_from_slope,
@@ -138,6 +147,38 @@ async def run_batched_confirmation(
 
         # Process each outstanding task against this capture
         completed_this_iter: list[int] = []
+        # v0.5.42: on the FIRST capture only, run an in-window survey
+        # for additional LoRa signals the bin-based aggregator missed.
+        # Subsequent captures cover the same band, so re-surveying is
+        # waste — one survey per cluster is enough.
+        if iteration == 1 and survey_cb is not None:
+            try:
+                survey_hits = survey_iq_window(
+                    capture.samples,
+                    sample_rate=capture.sample_rate,
+                    capture_center_hz=cluster.center_freq_hz,
+                    exclude_freqs_hz=[t.freq_hz for t in cluster.tasks],
+                )
+                for hit in survey_hits:
+                    try:
+                        survey_cb(hit)
+                    except Exception:
+                        log.exception(
+                            "survey_cb failed for hit at %.3f MHz",
+                            hit.freq_hz / 1e6,
+                        )
+                if survey_hits:
+                    log.info(
+                        "in-window survey for cluster@%.3f MHz: "
+                        "%d additional LoRa signal(s) discovered",
+                        cluster.center_freq_hz / 1e6, len(survey_hits),
+                    )
+            except Exception:
+                log.exception(
+                    "in-window survey failed for cluster@%.3f MHz",
+                    cluster.center_freq_hz / 1e6,
+                )
+
         for det_id, task in list(outstanding.items()):
             shift_hz = float(task.freq_hz - cluster.center_freq_hz)
             try:
@@ -184,22 +225,54 @@ async def run_batched_confirmation(
                         sf=sf, bandwidth_hz=task.bandwidth_hz
                     )
 
+                # v0.5.42: refined center frequency. The DDC put the
+                # task's expected freq at baseband (0 Hz), so the
+                # analyzer's offset is relative to that — add it back
+                # to recover the absolute refined center.
+                refined_center_hz = task.freq_hz
+                if result.refined_center_offset_hz is not None:
+                    refined_center_hz = task.freq_hz + int(
+                        result.refined_center_offset_hz
+                    )
+
+                # v0.5.42: channel-plan inference. Match against
+                # LoRaWAN US/EU868/AU915 + Meshtastic defaults using
+                # the refined center.
+                channel_match = match_channel(
+                    freq_hz=refined_center_hz,
+                    bandwidth_hz=task.bandwidth_hz,
+                )
+
                 elapsed = asyncio.get_event_loop().time() - start_time
                 log.info(
                     "LoRa confirmation success: %.3f MHz (%d kHz) "
-                    "→ SF%s %s after %.1fs / iter %d",
+                    "→ SF%s %s after %.1fs / iter %d%s",
                     task.freq_hz / 1e6, task.bandwidth_hz // 1000,
                     sf, variant, elapsed, iteration,
+                    (
+                        f" — matched {channel_match.description}"
+                        if channel_match else ""
+                    ),
                 )
                 if progress_cb is not None:
+                    plan_label = (
+                        f" / {channel_match.plan}:{channel_match.channel_id}"
+                        if channel_match else ""
+                    )
+                    snr_label = (
+                        f" SNR={result.snr_db:.0f}dB"
+                        if result.snr_db is not None else ""
+                    )
                     progress_cb(
-                        f"[confirm] {task.freq_hz/1e6:.3f} MHz → "
+                        f"[confirm] {refined_center_hz/1e6:.4f} MHz → "
                         f"SF{sf}"
                         + (f" ({variant})" if variant else "")
+                        + plan_label + snr_label
                         + f" after {elapsed:.0f}s"
                     )
 
-                # Update the detection row in place
+                # Update the detection row in place with all v0.5.42
+                # enrichments
                 try:
                     await detection_repo.update_metadata(
                         detection_id=det_id,
@@ -209,6 +282,19 @@ async def run_batched_confirmation(
                         chirp_confidence=float(result.chirp_confidence),
                         mean_slope_hz_per_sec=float(
                             result.mean_slope_hz_per_sec
+                        ),
+                        # v0.5.42 additions
+                        refined_center_hz=refined_center_hz,
+                        frequency_estimate_method=result.frequency_estimate_method,
+                        frequency_uncertainty_hz=result.frequency_uncertainty_hz,
+                        snr_db=result.snr_db,
+                        duty_cycle=result.duty_cycle,
+                        burst_total_duration_s=result.burst_total_duration_s,
+                        capture_duration_s=result.capture_duration_s,
+                        channel_plan=(channel_match.plan if channel_match else None),
+                        channel_id=(channel_match.channel_id if channel_match else None),
+                        channel_description=(
+                            channel_match.description if channel_match else None
                         ),
                     )
                 except Exception:

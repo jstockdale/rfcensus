@@ -431,7 +431,17 @@ async def _run_power_scan(band: BandConfig, ctx: StrategyContext):
             WideChannelAggregator,
         )
         wide_aggregator = WideChannelAggregator(
-            event_bus=ctx.event_bus, session_id=ctx.session_id
+            event_bus=ctx.event_bus,
+            session_id=ctx.session_id,
+            # v0.5.44: scan cadence for the background scanner task.
+            # The task runs _scan_and_emit every scan_interval_s
+            # (0.2 s = 5 Hz), independently of the observe() call rate
+            # (which can be 1000+ Hz during rtl_power bursts).
+            # Template scanning is CPU-heavy O(n·k) work; keeping it
+            # off the observe hot path via start()/stop() + interior
+            # yields prevents event-loop starvation that was killing
+            # decoder fanout clients pre-v0.5.44.
+            scan_interval_s=0.2,
         )
         analyzer = OccupancyAnalyzer(
             event_bus=ctx.event_bus,
@@ -445,11 +455,23 @@ async def _run_power_scan(band: BandConfig, ctx: StrategyContext):
             dwell_ms=200,
             duration_s=ctx.duration_s,
         )
+        # v0.5.44: start the background scanner task so the CPU-heavy
+        # template matching runs off the sample-processing hot path.
+        # Critical for co-existing with decoder fanout writer tasks —
+        # without this the scan blocks the event loop for 10-100 ms at
+        # a time and downstream decoder clients (rtl_433, rtlamr) hit
+        # their internal read timeouts and disconnect. See v0.5.44
+        # changelog for the bug that motivated this.
+        await wide_aggregator.start()
         try:
             samples_seen = await analyzer.consume(
                 backend.sweep(lease, spec), dongle_id=lease.dongle.id
             )
         finally:
+            # Stop the scanner task BEFORE releasing the lease — the
+            # task may still be running a scan; stop() waits for
+            # cancellation to complete before returning.
+            await wide_aggregator.stop()
             await ctx.broker.release(lease)
         if samples_seen == 0:
             # Backend exited without emitting any samples — almost

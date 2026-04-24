@@ -79,12 +79,23 @@ def run_async(coro):
     """Run an async coroutine on a new loop and return its result.
 
     Returns the coroutine's return value, or raises SystemExit(130)
-    on KeyboardInterrupt.
+    on KeyboardInterrupt. Also catches CancelledError escaping from
+    a double-Ctrl-C forced cancellation path (the second SIGINT
+    calls task.cancel() on the main loop's tasks; the CancelledError
+    that propagates up from asyncio.gather is not a KeyboardInterrupt
+    in Python 3.12, so we need to catch both).
     """
     try:
         return asyncio.run(coro)
     except KeyboardInterrupt:
         click.echo("\nInterrupted.", err=True)
+        raise SystemExit(130) from None
+    except asyncio.CancelledError:
+        # Double Ctrl-C path: task cancellation propagated up through
+        # asyncio.gather and escaped asyncio.run. Suppress the trace
+        # and exit cleanly — the user already saw the "forcing immediate
+        # exit" warning.
+        click.echo("\nCancelled.", err=True)
         raise SystemExit(130) from None
 
 

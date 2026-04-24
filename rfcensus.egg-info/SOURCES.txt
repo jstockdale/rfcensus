@@ -81,8 +81,10 @@ rfcensus/reporting/formats/json.py
 rfcensus/reporting/formats/text.py
 rfcensus/spectrum/__init__.py
 rfcensus/spectrum/backend.py
+rfcensus/spectrum/channel_plans.py
 rfcensus/spectrum/chirp_analysis.py
 rfcensus/spectrum/classifier.py
+rfcensus/spectrum/in_window_survey.py
 rfcensus/spectrum/iq_capture.py
 rfcensus/spectrum/noise_floor.py
 rfcensus/spectrum/occupancy.py

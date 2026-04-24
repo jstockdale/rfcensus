@@ -496,6 +496,9 @@ class SessionRunner:
                     self, "_current_session_id"
                 ) else 0,
                 progress_cb=_progress,
+                survey_cb=lambda hit: asyncio.get_event_loop().create_task(
+                    self._emit_survey_hit(hit, detection_repo)
+                ),
             )
         finally:
             if lease is not None:
@@ -511,6 +514,102 @@ class SessionRunner:
             band_id=task.band.id,
             decodes_emitted=len(confirmed_ids),
         )
+
+    async def _emit_survey_hit(self, hit, detection_repo) -> None:
+        """v0.5.42: handle a SurveyHit from in-window opportunistic survey.
+
+        A SurveyHit is a LoRa-like signal the wideband IQ revealed that
+        the bin-based aggregator missed (typically a sparse channel
+        whose bursts happened during sweep gaps). Treat it as a
+        confirmed detection — we already have IQ-validated chirp
+        evidence, so insert directly with full SF/variant/channel
+        metadata, no further confirmation queue trip needed.
+        """
+        from datetime import datetime, timezone
+        from rfcensus.detectors.builtin.lora import (
+            _estimate_sf_from_slope,
+            _label_variant,
+        )
+        from rfcensus.spectrum.channel_plans import match_channel
+        from rfcensus.storage.models import DetectionRecord
+
+        analysis = hit.chirp_analysis
+        sf = _estimate_sf_from_slope(
+            slope_hz_per_sec=analysis.mean_slope_hz_per_sec,
+            bandwidth_hz=hit.bandwidth_hz,
+        )
+        variant = (
+            _label_variant(sf=sf, bandwidth_hz=hit.bandwidth_hz)
+            if sf is not None else None
+        )
+        channel_match = match_channel(
+            freq_hz=hit.freq_hz, bandwidth_hz=hit.bandwidth_hz,
+        )
+        # Default tech to "lora"; channel match upgrades to "lorawan"
+        # when the freq/BW lands on a LoRaWAN grid channel
+        technology = "lora"
+        if channel_match and channel_match.plan.startswith("lorawan_"):
+            technology = "lorawan"
+        elif channel_match and channel_match.plan.startswith("meshtastic_"):
+            technology = "lora"  # Meshtastic is technically LoRa-PHY
+
+        record = DetectionRecord(
+            id=None,
+            session_id=self._current_session_id,
+            detector="lora",
+            technology=technology,
+            freq_hz=hit.freq_hz,
+            bandwidth_hz=hit.bandwidth_hz,
+            confidence=min(1.0, 0.6 + 0.2 * (analysis.chirp_confidence or 0.0)),
+            evidence=(
+                f"in-window IQ survey: {analysis.num_chirp_segments} chirp "
+                f"segments, slope {analysis.mean_slope_hz_per_sec/1e3:.0f} kHz/s, "
+                f"SNR {hit.snr_db:.1f} dB"
+            ),
+            hand_off_tools=[],
+            detected_at=datetime.now(timezone.utc),
+            metadata={
+                "discovery_method": "in_window_iq_survey",
+                "needs_iq_confirmation": False,  # already confirmed
+                "iq_confirmed": True,
+                "estimated_sf": sf,
+                "variant": variant,
+                "chirp_confidence": float(analysis.chirp_confidence),
+                "mean_slope_hz_per_sec": float(analysis.mean_slope_hz_per_sec),
+                "snr_db": analysis.snr_db,
+                "duty_cycle": analysis.duty_cycle,
+                "burst_total_duration_s": analysis.burst_total_duration_s,
+                "capture_duration_s": analysis.capture_duration_s,
+                "refined_center_hz": hit.freq_hz,
+                "frequency_estimate_method": analysis.frequency_estimate_method,
+                "frequency_uncertainty_hz": analysis.frequency_uncertainty_hz,
+                "channel_plan": channel_match.plan if channel_match else None,
+                "channel_id": channel_match.channel_id if channel_match else None,
+                "channel_description": (
+                    channel_match.description if channel_match else None
+                ),
+            },
+        )
+        try:
+            det_id = await detection_repo.insert(record)
+            log.info(
+                "v0.5.42 survey detection: %.3f MHz / %d kHz / SF%s%s "
+                "(SNR %.1f dB)%s — id=%d",
+                hit.freq_hz / 1e6, hit.bandwidth_hz // 1000,
+                sf or "?",
+                f" {variant}" if variant else "",
+                hit.snr_db,
+                (
+                    f" — matched {channel_match.description}"
+                    if channel_match else ""
+                ),
+                det_id,
+            )
+        except Exception:
+            log.exception(
+                "failed to insert survey detection at %.3f MHz",
+                hit.freq_hz / 1e6,
+            )
 
     async def _offer_confirmation_wave(self, detection_repo) -> None:
         """Prompt the operator to run an additional confirmation-only
@@ -826,6 +925,10 @@ class SessionRunner:
                 config_snap=self.config.model_dump(),
             )
         )
+        # v0.5.42: stash session_id on self so the in-window survey
+        # handler (called from confirmation_task callback) can build
+        # DetectionRecords with the right session FK.
+        self._current_session_id = session_id
 
         for dongle in self.registry.usable():
             await dongle_repo.upsert(

@@ -57,8 +57,10 @@ stream — we want "detected LoRa here" once, not every 500ms.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from rfcensus.events import EventBus, WideChannelEvent
 from rfcensus.utils.logging import get_logger
@@ -209,6 +211,19 @@ class WideChannelAggregator:
     floor sample. The aggregator itself scans and emits on a cooldown
     to avoid per-sample scan cost.
 
+    v0.5.43: `scan_interval_s` enforces the cooldown. Bin activity is
+    updated on every observe() (cheap dict update), but the full
+    template-matching scan runs at most every scan_interval_s seconds.
+    Prior to v0.5.43 the cooldown was claimed in docs but not actually
+    implemented — which caused a field regression where the sync scan
+    on every sample (1040 samples per rtl_power sweep × 3 templates)
+    blocked the asyncio event loop for hundreds of milliseconds per
+    sweep, long enough that decoder fanout writer tasks fell behind
+    their socket buffers and downstream rtl_433 clients hit read
+    timeouts and exited — appearing as `ended_by=both_simultaneously`
+    disconnects across multiple fanouts at the same wall-clock
+    moment.
+
     Thread/async safety: all methods assume single-threaded asyncio
     execution. State is not protected by locks.
     """
@@ -230,6 +245,21 @@ class WideChannelAggregator:
     # candidates with centers closer than template_hz /
     # center_distance_divisor are considered the same signal.
     center_distance_divisor: float = DEFAULT_CENTER_DISTANCE_DIVISOR
+    # v0.5.43: scan cooldown. When > 0, the full template scan runs at
+    # most this often. Bin state still updates on every observe() so
+    # no activity is lost; the scan just batches. 200 ms is well below
+    # typical LoRa burst duration (100-500 ms+) so real bursts still
+    # get caught. Each sweep from a 26 MHz rtl_power at 25 kHz bins
+    # has ~1040 samples arriving in a burst once per second; with no
+    # cooldown that's 1040 × 3 templates = 3120 scans per second,
+    # synchronous on the event loop. With 200 ms cooldown it's 5
+    # scans per sweep.
+    #
+    # Default 0 keeps the v0.5.38-v0.5.42 behavior (scan on every
+    # sample) for tests and third-party code that may relied on it.
+    # Production callers should set this to 0.2 explicitly — see
+    # engine/strategy.py where the aggregator is wired for scans.
+    scan_interval_s: float = 0.0
 
     def __post_init__(self) -> None:
         # Per-bin activity state, keyed by freq_hz
@@ -243,6 +273,29 @@ class WideChannelAggregator:
         self._last_emitted: dict[tuple[int, int, int], datetime] = {}
         # Dongle that's feeding us samples (for attribution)
         self._current_dongle_id: str = ""
+        # v0.5.43: cooldown tracker for backward-compatible inline scan
+        # (when no background scanner is running). Uses the monotonic
+        # event-loop clock. None means "never scanned" → first observe
+        # forces a scan.
+        self._last_scan_monotonic: float | None = None
+        # v0.5.44: background scanner task. When not None, observe()
+        # does NOT scan — the task runs _scan_and_emit on a regular
+        # cadence. This decouples CPU-heavy template matching from
+        # the observe() hot path (which runs at rtl_power sample rate,
+        # ~1000/s in the 915 MHz ISM band) and lets the event loop
+        # keep servicing decoder fanout writer tasks even when a
+        # single scan takes tens of ms.
+        self._scanner_task: asyncio.Task | None = None
+        # v0.5.44: flag set when stop() is called so the loop can
+        # distinguish cancellation-for-shutdown from other cancels.
+        self._scanner_stopping: bool = False
+        # v0.5.44: instrumentation — warn if the bin dict grows
+        # unexpectedly large (suggests above-floor threshold is too
+        # permissive) or if a single scan takes too long (suggests
+        # we need finer-grained yields). Rate-limited to avoid log
+        # flooding.
+        self._last_bin_count_warn: float = 0.0
+        self._last_scan_duration_warn: float = 0.0
 
     async def observe(
         self,
@@ -253,13 +306,20 @@ class WideChannelAggregator:
         now: datetime,
         dongle_id: str,
     ) -> None:
-        """Record one above-floor sample and scan for composites.
+        """Record one above-floor sample.
 
-        We scan on every observation — the scan short-circuits quickly
-        when the active-bin count is below the minimum needed for any
-        template match (which is the common case), so per-observe
-        scanning is cheap. Keeping this simple avoids missing short
-        bursts between scan intervals.
+        v0.5.44: O(1) path only. Updates bin state and returns. The
+        expensive template scan runs on a background task started
+        via start() — NOT on the observe() hot path. This decouples
+        sample-rate work (can be 1000+ Hz) from CPU-heavy scanning
+        (which may take 10-100ms per run in busy bands) so the
+        event loop keeps servicing other coroutines.
+
+        For backward compatibility, if start() has NOT been called
+        (no background scanner active), observe() falls back to
+        inline scanning with v0.5.43's cooldown semantics. This
+        preserves behavior for tests and callers that never added
+        the start/stop lifecycle.
         """
         self._current_dongle_id = dongle_id
 
@@ -276,7 +336,126 @@ class WideChannelAggregator:
             self._bins[freq_hz] = bin_state
         bin_state.update(now, power_dbm, noise_floor_dbm)
 
+        # v0.5.44: if background scanner is running, observe() is done.
+        # The task will scan on its own cadence.
+        if self._scanner_task is not None:
+            return
+
+        # Backward compat path: no scanner task, so run inline scan
+        # honoring the v0.5.43 cooldown. Tests and callers that don't
+        # use start/stop still get scans; they just get them on the
+        # observe hot path (which is fine for test workloads).
+        try:
+            mono_now = asyncio.get_event_loop().time()
+        except RuntimeError:
+            mono_now = None
+
+        if (
+            self._last_scan_monotonic is not None
+            and mono_now is not None
+            and (mono_now - self._last_scan_monotonic) < self.scan_interval_s
+        ):
+            return
+        if mono_now is not None:
+            self._last_scan_monotonic = mono_now
+
         await self._scan_and_emit(now)
+
+    # ----------------------------------------------------------------
+    # v0.5.44: background scanner lifecycle
+    # ----------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Launch the background scanner task.
+
+        After this call, observe() stops doing inline scans — the
+        task drives all scanning on a fixed cadence (scan_interval_s,
+        defaulting to 0.2 s if configured that way, or 0.5 s if still
+        at the backward-compat default of 0).
+
+        Idempotent: calling start() a second time is a no-op.
+        """
+        if self._scanner_task is not None:
+            return
+        self._scanner_stopping = False
+        # If scan_interval_s was left at 0 (backward-compat default)
+        # but start() is being explicitly called, use a sensible
+        # production cadence. 0.5 s = 2 Hz, plenty fast to catch
+        # LoRa bursts (100-500 ms) from the 5-second rolling window.
+        effective_interval = (
+            self.scan_interval_s if self.scan_interval_s > 0 else 0.5
+        )
+        self._scanner_effective_interval_s = effective_interval
+        self._scanner_task = asyncio.create_task(
+            self._scanner_loop(effective_interval),
+            name="wide-channel-scanner",
+        )
+        log.info(
+            "wide-channel scanner task started (cadence %.2fs)",
+            effective_interval,
+        )
+
+    async def stop(self) -> None:
+        """Cancel the background scanner task and wait for cleanup.
+
+        Safe to call multiple times; safe to call if never started.
+        """
+        if self._scanner_task is None:
+            return
+        self._scanner_stopping = True
+        self._scanner_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self._scanner_task
+        self._scanner_task = None
+        log.info("wide-channel scanner task stopped")
+
+    async def _scanner_loop(self, interval_s: float) -> None:
+        """Background scan loop. Runs until cancelled.
+
+        Each iteration: sleep for interval_s, then run _scan_and_emit
+        using the current wall-clock time (no sample timestamp
+        available at this level — we're decoupled from the sample
+        stream). Exceptions in a single iteration are logged but
+        don't kill the loop; a 500ms backoff prevents tight error
+        loops.
+        """
+        try:
+            while True:
+                await asyncio.sleep(interval_s)
+                try:
+                    scan_start = asyncio.get_event_loop().time()
+                    await self._scan_and_emit(datetime.now(timezone.utc))
+                    scan_elapsed = asyncio.get_event_loop().time() - scan_start
+                    # Instrument long scans. Rate-limit warnings to
+                    # once per 10 s so a persistently-busy band
+                    # doesn't spam the log.
+                    if scan_elapsed > 0.1:
+                        now_mono = asyncio.get_event_loop().time()
+                        if now_mono - self._last_scan_duration_warn > 10.0:
+                            log.warning(
+                                "wide-channel scan took %.0f ms with "
+                                "%d active bins — event loop held for "
+                                "that duration. If decoder fanout "
+                                "clients disconnect, further tuning "
+                                "may be needed.",
+                                scan_elapsed * 1000.0, len(self._bins),
+                            )
+                            self._last_scan_duration_warn = now_mono
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception(
+                        "wide-channel scanner iteration failed — "
+                        "backing off 500 ms and continuing"
+                    )
+                    await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            if not self._scanner_stopping:
+                log.warning(
+                    "wide-channel scanner cancelled unexpectedly (not "
+                    "via stop())"
+                )
+            raise
 
     async def _scan_and_emit(self, now: datetime) -> None:
         """Prune stale bins, then look for composites matching templates.
@@ -288,10 +467,39 @@ class WideChannelAggregator:
         3-5 overlapping events for a single 250 kHz LoRa burst (which
         happens naturally because the sliding-window search finds
         partial matches at many start positions).
+
+        v0.5.44: cooperative yields between templates so even in a
+        pathologically-busy band (thousands of active bins) the event
+        loop gets control back between chunks of work. Without yields,
+        the full scan was an atomic blocking operation from the loop's
+        perspective, which was the root cause of the v0.5.43-era
+        decoder-fanout cascade.
         """
         self._prune_stale(now)
         if not self._bins:
             return
+
+        # v0.5.44: instrument unusual bin counts. A 26 MHz rtl_power
+        # scan at 25 kHz bins has ~1040 total bins; in a quiet band
+        # we'd expect maybe 20-50 above-floor. Over 500 suggests the
+        # OccupancyAnalyzer's above-floor threshold is too permissive
+        # (we're tracking noise as activity) — separate tuning but
+        # worth surfacing. Rate-limited so it doesn't spam.
+        bin_count = len(self._bins)
+        if bin_count > 500:
+            try:
+                now_mono = asyncio.get_event_loop().time()
+            except RuntimeError:
+                now_mono = 0.0
+            if now_mono - self._last_bin_count_warn > 30.0:
+                log.warning(
+                    "wide-channel aggregator tracking %d active bins — "
+                    "expected < 200 in normal ISM traffic. Above-floor "
+                    "threshold may be too low (noise being tracked as "
+                    "activity), or the band is genuinely saturated.",
+                    bin_count,
+                )
+                self._last_bin_count_warn = now_mono
 
         sorted_freqs = sorted(self._bins.keys())
         bin_widths = sorted(b.bin_width_hz for b in self._bins.values())
@@ -299,9 +507,10 @@ class WideChannelAggregator:
         if bin_width <= 0:
             return
 
-        # Collect all candidate matches
+        # Collect all candidate matches, yielding between templates so
+        # the event loop gets a turn even on large bin counts.
         candidates: list[_Candidate] = []
-        for template_hz in self.templates_hz:
+        for i, template_hz in enumerate(self.templates_hz):
             self._collect_template_candidates(
                 template_hz=template_hz,
                 sorted_freqs=sorted_freqs,
@@ -309,6 +518,13 @@ class WideChannelAggregator:
                 now=now,
                 out=candidates,
             )
+            # v0.5.44: yield between templates. Each template's work
+            # is bounded (O(n×k) where k is ~10 bins per span), but
+            # back-to-back on 3 templates with 1000+ bins can block
+            # the loop for 100+ms. One await between each gives
+            # other coroutines (fanout writers) a chance to drain.
+            if i + 1 < len(self.templates_hz):
+                await asyncio.sleep(0)
 
         if not candidates:
             return
