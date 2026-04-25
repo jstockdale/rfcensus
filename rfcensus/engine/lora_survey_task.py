@@ -145,6 +145,21 @@ _CMD_SET_SAMPLE_RATE = 0x02
 # rtl_tcp greeting header is 12 bytes; we consume but don't use it.
 _RTL_TCP_HEADER_SIZE = 12
 
+# v0.6.11: maximum chunks held between the read-drain loop and the
+# analyze loop. Each chunk is _READ_CHUNK_BYTES of raw rtl_tcp bytes
+# (decoded to complex64 = 4× larger). At 16 chunks × 256 KB/chunk =
+# 4 MB peak queue memory, ~220 ms of buffered IQ. Generous enough to
+# absorb scheduler jitter on a Pi 5 under load, bounded enough to
+# never become the cause of memory pressure. When the queue fills
+# (because the analyzer is busy), the read-drain loop discards the
+# OLDEST queued chunk to keep up — we'd rather process FRESH IQ
+# than stale IQ. The previous design (single coroutine that awaited
+# analysis between reads) caused the fanout to mark the survey
+# client as "slow" and drop chunks from the OUTSIDE, with no
+# visibility — this design moves the dropping inside the survey
+# task where we can count and report it.
+_READ_QUEUE_MAXSIZE = 16
+
 
 # ────────────────────────────────────────────────────────────────────
 # Stats record (returned from run() for the strategy summary)
@@ -165,6 +180,18 @@ class LoraSurveyStats:
     duration_s: float = 0.0
     ended_reason: str = ""  # "duration", "cancelled", "upstream_eof", "error"
     errors: list[str] = field(default_factory=list)
+    # v0.6.11: read/analyze decoupling visibility. chunks_dropped_local
+    # is the count of chunks we dropped INSIDE the survey task because
+    # the analyzer fell behind (vs. chunks dropped by the upstream
+    # fanout, which we can't count from here). read_queue_high_water
+    # tracks the peak depth of the queue between the two loops, so
+    # operators can see how close to saturation we ran.
+    # analysis_duration_s_total accumulates wall-clock time spent in
+    # survey_iq_window so the heartbeat can show what fraction of the
+    # run is analysis-bound vs. I/O-bound.
+    chunks_dropped_local: int = 0
+    read_queue_high_water: int = 0
+    analysis_duration_s_total: float = 0.0
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -336,11 +363,14 @@ class LoraSurveyTask:
         log.info(
             "lora_survey[%s]: ended (%s) — chunks=%d, above_floor=%d, "
             "analyses=%d, detections=%d, suppressed=%d, floor=%.1f dB, "
+            "dropped_local=%d, queue_hwm=%d, analysis_total=%.1fs, "
             "%.1fs",
             self.band.id, stats.ended_reason or "ok",
             stats.chunks_read, stats.chunks_above_floor,
             stats.analyses_performed, stats.detections_emitted,
             stats.suppressed_by_refractory, stats.final_noise_floor_db,
+            stats.chunks_dropped_local, stats.read_queue_high_water,
+            stats.analysis_duration_s_total,
             stats.duration_s,
         )
         return stats
@@ -392,16 +422,196 @@ class LoraSurveyTask:
     async def _stream_loop(
         self, stats: LoraSurveyStats, wall_start: float,
     ) -> None:
-        """Continuous IQ streaming with cheap energy gate + accumulating
-        analysis window."""
+        """Orchestrator: spawns the read-drain and analyze loops as
+        separate tasks and joins them.
+
+        v0.6.11: split from one serial loop into two concurrent loops
+        connected by a bounded queue. Why: the previous serial design
+        (read → energy_gate → maybe await analyze → repeat) blocked
+        socket reads for the duration of an analysis (~3s of CPU on a
+        Pi 5). During that block, the upstream fanout's per-client
+        queue overflowed, the fanout marked us as "slow client", and
+        chunks were silently dropped UPSTREAM with no way for the
+        survey to see, count, or react. The user's 6-min metatron run
+        showed >9000 chunks dropped this way, ~30% data loss across
+        the run. Bursty Meshtastic traffic (transmitting once every
+        1-15 minutes) was disproportionately affected — a single
+        analysis at the wrong moment could lose the only packet of
+        the run.
+
+        New design:
+          • _read_drain_loop: tight loop that ONLY reads from socket
+            and pushes decoded samples to a bounded queue. Never
+            blocks on analysis.
+          • _analyze_loop: pops from queue, runs energy gate,
+            accumulates above-floor IQ, runs heavy analysis when
+            window is full.
+          • When the queue fills (analyzer falling behind), the
+            read-drain loop drops the OLDEST queued chunk and
+            increments stats.chunks_dropped_local. We prefer fresh
+            data over stale data, and we KNOW we dropped — versus
+            silently losing arbitrary chunks to the fanout.
+        """
         deadline = wall_start + self.duration_s
+
+        # Bounded queue. Items are (timestamp_mono, complex64_array)
+        # tuples; the timestamp lets the analyze loop log staleness
+        # and the heartbeat report queue latency if needed.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_READ_QUEUE_MAXSIZE)
+
+        read_task = asyncio.create_task(
+            self._read_drain_loop(stats, queue, deadline),
+            name=f"lora_survey_read-{self.band.id}",
+        )
+        analyze_task = asyncio.create_task(
+            self._analyze_loop(stats, queue, deadline),
+            name=f"lora_survey_analyze-{self.band.id}",
+        )
+
+        # If either loop exits, cancel the other and wait. The first
+        # loop to set stats.ended_reason wins; we don't override.
+        done, pending = await asyncio.wait(
+            {read_task, analyze_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        # Drain the cancellations + collect any exceptions.
+        for t in pending:
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+        for t in done:
+            # Re-raise to let run()'s outer handler do its thing.
+            exc = t.exception()
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                raise exc
+
+    async def _read_drain_loop(
+        self,
+        stats: LoraSurveyStats,
+        queue: asyncio.Queue,
+        deadline: float,
+    ) -> None:
+        """Drain the fanout socket as fast as possible, putting
+        decoded chunks on `queue`. Never blocks on analysis.
+
+        When the queue is full (analyzer behind), discards the OLDEST
+        item to make room and increments stats.chunks_dropped_local.
+        This way we always read from the socket fast enough that the
+        upstream fanout never sees us as a slow client.
+
+        On completion, puts a None sentinel on the queue so the
+        analyze loop knows to drain remaining items and exit.
+        """
+        try:
+            while True:
+                if self._cancelled.is_set():
+                    stats.ended_reason = stats.ended_reason or "cancelled"
+                    return
+                now_mono = time.monotonic()
+                if now_mono >= deadline:
+                    stats.ended_reason = stats.ended_reason or "duration"
+                    return
+
+                # Read one chunk with a short timeout so cancellation
+                # / deadline checks happen even on a quiet stream.
+                try:
+                    chunk_remaining = max(0.0, deadline - now_mono)
+                    read_timeout = min(2.0, chunk_remaining + 0.5)
+                    raw = await asyncio.wait_for(
+                        self._reader.readexactly(_READ_CHUNK_BYTES),
+                        timeout=read_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.IncompleteReadError as exc:
+                    if exc.partial:
+                        raw = exc.partial
+                        stats.chunks_read += 1
+                        stats.bytes_read += len(raw)
+                    stats.ended_reason = stats.ended_reason or "upstream_eof"
+                    log.info(
+                        "lora_survey[%s]: fanout closed (read %d bytes "
+                        "in last partial chunk)",
+                        self.band.id,
+                        len(exc.partial) if exc.partial else 0,
+                    )
+                    return
+
+                stats.chunks_read += 1
+                stats.bytes_read += len(raw)
+
+                # Decode HERE (in the fast read loop) so the queue
+                # holds ready-to-process complex64 arrays. The decode
+                # is ~50 µs vs ~14 ms read interval — negligible.
+                samples = self._decode_chunk(raw)
+                if samples.size == 0:
+                    continue
+
+                # Try to put. If full, drop OLDEST to make room.
+                try:
+                    queue.put_nowait(samples)
+                except asyncio.QueueFull:
+                    # Drop oldest, retry put. This is the v0.6.11 core
+                    # behavior: when the analyzer is slow, we lose
+                    # FRESH data instead of holding back the socket.
+                    try:
+                        _ = queue.get_nowait()
+                        stats.chunks_dropped_local += 1
+                    except asyncio.QueueEmpty:
+                        # Race: analyzer drained between QueueFull and
+                        # get_nowait. Fine — we can put now.
+                        pass
+                    try:
+                        queue.put_nowait(samples)
+                    except asyncio.QueueFull:
+                        # Should not happen (we just made room), but
+                        # if it does the chunk is lost. Count it.
+                        stats.chunks_dropped_local += 1
+
+                # Track high-water for diagnostics.
+                qsize = queue.qsize()
+                if qsize > stats.read_queue_high_water:
+                    stats.read_queue_high_water = qsize
+        finally:
+            # Always signal end-of-stream to the analyzer, even on
+            # exception, so it can drain and exit cleanly. If the
+            # queue is full (analyzer behind), make room by dropping
+            # one chunk — losing one chunk during shutdown is far
+            # better than the analyzer hanging forever waiting for a
+            # sentinel it never sees.
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                try:
+                    _ = queue.get_nowait()
+                    stats.chunks_dropped_local += 1
+                except asyncio.QueueEmpty:
+                    pass
+                with contextlib.suppress(asyncio.QueueFull):
+                    queue.put_nowait(None)
+
+    async def _analyze_loop(
+        self,
+        stats: LoraSurveyStats,
+        queue: asyncio.Queue,
+        deadline: float,
+    ) -> None:
+        """Pop chunks from queue, energy-gate, accumulate, analyze.
+
+        Energy gate keeps the heavy DSP off the hot path 99% of the
+        time. When the accumulator reaches one analysis window of
+        above-floor IQ, the heavy analysis runs (off-thread via
+        asyncio.to_thread so the event loop stays responsive for the
+        read-drain loop's socket I/O).
+
+        Exits when it sees the None sentinel from the read loop, when
+        cancelled, or when the deadline passes.
+        """
+        wall_start = time.monotonic()
         noise_floor_lin = _INITIAL_NOISE_FLOOR_LIN
         gate_threshold_lin_factor = 10.0 ** (self.gate_threshold_db / 10.0)
 
-        # Pre-allocate the reusable scratch buffer for chunk decoding.
-        # frombuffer is zero-copy but the float conversion copies; we
-        # reuse the destination to avoid per-chunk allocation pressure.
-        chunk_samples = _READ_CHUNK_BYTES // _BYTES_PER_SAMPLE
         analysis_window_samples = int(
             self.sample_rate * self.analysis_window_s
         )
@@ -409,62 +619,36 @@ class LoraSurveyTask:
             analysis_window_samples * _MAX_BUFFER_SAMPLES_MULTIPLIER
         )
 
-        # Accumulator for above-floor IQ. List of complex64 numpy
-        # arrays, concatenated at analysis time.
         accumulator: list[np.ndarray] = []
         accumulated_samples = 0
-
         last_heartbeat = wall_start
 
         while True:
             if self._cancelled.is_set():
-                stats.ended_reason = "cancelled"
+                stats.ended_reason = stats.ended_reason or "cancelled"
+                return
+            if time.monotonic() >= deadline:
+                stats.ended_reason = stats.ended_reason or "duration"
                 return
 
-            now_mono = time.monotonic()
-            if now_mono >= deadline:
-                stats.ended_reason = "duration"
-                return
-
-            # Read one chunk with a short timeout — lets us check
-            # cancellation + deadline regularly even on a quiet stream.
+            # Pop with a short timeout so cancellation/deadline
+            # checks happen even when the queue is empty.
             try:
-                chunk_remaining = max(0.0, deadline - now_mono)
-                read_timeout = min(2.0, chunk_remaining + 0.5)
-                raw = await asyncio.wait_for(
-                    self._reader.readexactly(_READ_CHUNK_BYTES),
-                    timeout=read_timeout,
-                )
+                samples = await asyncio.wait_for(queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
-                # Just loop and re-check cancellation/deadline.
                 continue
-            except asyncio.IncompleteReadError as exc:
-                # Upstream closed (fanout torn down, dongle lost, etc.)
-                if exc.partial:
-                    # Process the tail before giving up.
-                    raw = exc.partial
-                    stats.chunks_read += 1
-                    stats.bytes_read += len(raw)
-                stats.ended_reason = "upstream_eof"
-                log.info(
-                    "lora_survey[%s]: fanout closed (read %d bytes "
-                    "in last partial chunk)",
-                    self.band.id,
-                    len(exc.partial) if exc.partial else 0,
-                )
+            if samples is None:
+                # Read loop signalled end-of-stream. Drain anything
+                # still in the accumulator if it's enough to analyze.
+                if accumulated_samples >= analysis_window_samples:
+                    window = np.concatenate(accumulator)
+                    accumulator.clear()
+                    accumulated_samples = 0
+                    await self._analyze_window(window, stats)
                 return
-
-            stats.chunks_read += 1
-            stats.bytes_read += len(raw)
-
-            # ── Decode u8-pair → complex64 ──
-            samples = self._decode_chunk(raw)
-            if samples.size == 0:
-                continue
 
             # ── Cheap energy gate ──
             chunk_power_lin = float(np.mean(np.abs(samples) ** 2))
-            # EMA noise floor — small alpha so brief bursts barely move it.
             noise_floor_lin = (
                 (1.0 - _NOISE_FLOOR_EMA_ALPHA) * noise_floor_lin
                 + _NOISE_FLOOR_EMA_ALPHA * chunk_power_lin
@@ -474,10 +658,25 @@ class LoraSurveyTask:
                 10.0 * np.log10(max(noise_floor_lin, 1e-20))
             )
 
+            # Heartbeat (in this loop because it ticks regularly even
+            # when the read loop is fast — emits once per ~minute).
+            now_mono = time.monotonic()
+            if now_mono - last_heartbeat > _HEARTBEAT_INTERVAL_S:
+                last_heartbeat = now_mono
+                log.info(
+                    "lora_survey[%s]: heartbeat — chunks=%d, "
+                    "above_floor=%d, analyses=%d, detections=%d, "
+                    "floor=%.1f dB, dropped_local=%d, queue_hwm=%d, "
+                    "analysis_total=%.1fs",
+                    self.band.id, stats.chunks_read,
+                    stats.chunks_above_floor, stats.analyses_performed,
+                    stats.detections_emitted, stats.final_noise_floor_db,
+                    stats.chunks_dropped_local,
+                    stats.read_queue_high_water,
+                    stats.analysis_duration_s_total,
+                )
+
             if chunk_power_lin < gate_lin:
-                # Quiet chunk — drop it, continue. This is the common
-                # case in idle bands and the whole reason the gate is
-                # cheap (one mean + abs over 32K complex samples).
                 continue
 
             stats.chunks_above_floor += 1
@@ -486,10 +685,7 @@ class LoraSurveyTask:
             accumulator.append(samples)
             accumulated_samples += samples.size
 
-            # Defensive: trim oldest if accumulator grows past sane
-            # bounds. Shouldn't happen with the analysis_window_samples
-            # threshold below firing first, but guards against runaway
-            # loud bands where every chunk is "above floor".
+            # Defensive trim if accumulator grows past sane bounds.
             while accumulated_samples > max_buffer_samples and accumulator:
                 dropped = accumulator.pop(0)
                 accumulated_samples -= dropped.size
@@ -498,23 +694,10 @@ class LoraSurveyTask:
                 window = np.concatenate(accumulator)
                 accumulator.clear()
                 accumulated_samples = 0
-                # Run the expensive analysis off the read hot path —
-                # we await it but it's bounded (~10-30 ms typical).
-                # The await also yields to other coroutines (fanout
-                # writers, decoder cleanup), keeping the event loop
-                # responsive.
+                analysis_start = time.monotonic()
                 await self._analyze_window(window, stats)
-
-            # ── Heartbeat ──
-            if now_mono - last_heartbeat > _HEARTBEAT_INTERVAL_S:
-                last_heartbeat = now_mono
-                log.info(
-                    "lora_survey[%s]: heartbeat — chunks=%d, "
-                    "above_floor=%d, analyses=%d, detections=%d, "
-                    "floor=%.1f dB",
-                    self.band.id, stats.chunks_read,
-                    stats.chunks_above_floor, stats.analyses_performed,
-                    stats.detections_emitted, stats.final_noise_floor_db,
+                stats.analysis_duration_s_total += (
+                    time.monotonic() - analysis_start
                 )
 
     # ────────────────────────────────────────────────────────────────
