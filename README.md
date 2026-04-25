@@ -2,34 +2,94 @@
 
 A site survey and inventory tool for the RF environment around you.
 
-rfcensus coordinates one or more SDR dongles – RTL-SDR, HackRF, NESDR, etc. – to
-discover, characterize, and identify the radio transmitters in your local
+rfcensus coordinates one or more SDR dongles – RTL-SDR, HackRF, NESDR, etc. –
+to discover, characterize, and identify the radio transmitters in your local
 environment. Point it at your bands of interest and it will tell you what's
 out there, what protocol each transmitter is speaking, and flag signals it
 doesn't recognize for you to investigate.
 
 ## Status
 
-Alpha. Being built in the open. Expect rough edges, sharp corners, and occasional
-bleeding.
+Alpha. Being built in the open. Expect rough edges, sharp corners, and
+occasional bleeding.
 
 ## What it does today
 
-• Enumerates RTL-SDR and HackRF hardware on your system
-• Runs multiple decoders in parallel across multiple dongles (rtl_433, rtlamr,
-  rtl-ais, multimon-ng, direwolf)
-• Power scans with rtl_power or hackrf_sweep depending on hardware
+• Enumerates RTL-SDR and HackRF hardware on your system, with a friendly
+  setup wizard for assigning antennas to dongles
+• Coordinates a fleet of dongles in parallel – packs decoders into "waves"
+  so non-conflicting bands run simultaneously instead of sequentially
+• Optimizes antenna→dongle assignment across your fleet so each band is
+  served by the best-matched antenna available
+• Runs five built-in decoders (rtl_433, rtlamr, rtl-ais, multimon-ng,
+  direwolf) and three detectors (LoRa, P25, WiFi/BT-ISM)
+• Power scans with rtl_power or hackrf_sweep depending on hardware,
+  with a wide-channel aggregator that recognizes wide signals (LoRa,
+  Meshtastic) by their FFT footprint
 • Identifies active channels, classifies them, tracks them over time
-• Deduplicates decodes into persistent "emitter" records with confidence scoring
-• Flags unknown persistent carriers for manual investigation
-• Privacy-preserving by default (device IDs are hashed in reports)
+• Deduplicates decodes into persistent *emitter* records with confidence
+  scoring and a confirmation queue for IQ-replay verification
+• Flags unknown persistent carriers as *mystery carriers* for manual
+  investigation
+• Lets you pin specific decoders to specific dongles for gap-free
+  long-running coverage of targets you care about
+• Persists everything to SQLite with retention windows; supports
+  baseline-and-diff comparison across sessions
+• Privacy-preserving by default – device IDs are hashed in reports unless
+  you opt in to raw values
 
 ## What it doesn't do yet
 
-• No TUI / web UI (coming next)
+• No TUI / web UI (the next big feature on the roadmap)
 • No satellite pass prediction + SatDump hand-off
-• No P25 trunk-following (identifies P25 control channels and recommends SDRTrunk)
-• No detection-only modules yet (LoRa, P25 CC, TETRA, LTE fingerprinting)
+• No P25 trunk-following (identifies P25 control channels and recommends
+  SDRTrunk)
+• No ADS-B decoding – mature ecosystem already exists (dump1090, readsb,
+  tar1090, FlightAware Feeder); rfcensus stays out of that lane
+• No multi-site location mapping (planned alongside GPS support)
+
+## Concepts
+
+A few terms come up everywhere – knowing them up front makes the rest of
+this document make sense.
+
+• **Site** – your physical location and the configuration that goes with
+  it (bands of interest, dongles you own, antennas you have). Lives in
+  `~/.config/rfcensus/site.toml`.
+
+• **Dongle** – one SDR (RTL-SDR, HackRF, etc.). Each has an identifier,
+  a serial, a model, and an optional antenna assignment.
+
+• **Antenna** – a physical antenna with a usable frequency range. The
+  same dongle paired with different antennas covers wildly different
+  parts of the spectrum well. The catalogue ships eight stock options
+  (whip_315, whip_433, whip_915, dipole_1090, discone, etc.) and you
+  can define your own.
+
+• **Band** – a frequency range with a strategy and decoder hints (e.g.
+  "433 MHz ISM, decoder_primary, suggested decoder rtl_433"). 21 bands
+  are defined out of the box for the US; you can enable, disable, or
+  add your own.
+
+• **Decoder** – a subprocess decoder that produces structured decodes
+  from IQ data (rtl_433 for OOK/FSK ISM devices, rtlamr for utility
+  meters, etc.).
+
+• **Detector** – a pattern recognizer that flags signals without
+  decoding them (LoRa chirps, P25 control channels, WiFi/BT carriers
+  in 2.4 GHz ISM).
+
+• **Decode** – one structured frame parsed by a decoder. A weather
+  station beacon, a TPMS reading, a POCSAG paging message.
+
+• **Emitter** – a persistent transmitter rfcensus has seen across
+  multiple decodes. Decodes are deduplicated into emitters by hashed
+  device ID, and emitters carry confidence scores based on how many
+  times they've been confirmed.
+
+• **Session** – one run of `scan`, `inventory`, or `hybrid`. All
+  decodes, emitters, and active channels are tagged with their
+  session ID for later comparison.
 
 ## Quick start
 
@@ -42,18 +102,284 @@ pip install -e .
 # Or --all to include optional HackRF and direwolf:
 ./scripts/install_decoders.sh --all
 
-# Set up your site config
+# Generate a starter config
 rfcensus init
 
-# Verify everything works
+# Walk the friendly setup wizard to assign antennas to your dongles
+rfcensus setup
+
+# Verify everything is healthy (binaries installed, dongles detected,
+# config valid, database writable)
 rfcensus doctor
 
-# Run a quick inventory
-rfcensus inventory --duration 10m
+# Quick survey of what's at your site
+rfcensus scan --duration 5m
 
-# See what's been identified
+# See what was identified
 rfcensus list emitters
 ```
+
+## Commands
+
+Three categories: setup-time, runtime, and inspection.
+
+**Setup time** – done once, or whenever you change hardware
+
+| Command | What it does |
+| --- | --- |
+| `rfcensus init` | Generate a starter `site.toml` and privacy salt |
+| `rfcensus setup` | Interactive wizard: assign antennas to detected dongles |
+| `rfcensus setup new` | Same wizard, but only walks dongles not already in config |
+| `rfcensus suggest antennas` | Optimize antenna→dongle assignment across your fleet |
+| `rfcensus pin` | Wizard for dedicating a dongle to a decoder + frequency |
+| `rfcensus pin add\|list\|remove\|clear` | Non-interactive pin management |
+| `rfcensus doctor` | Health check: hardware, binaries, config, database |
+| `rfcensus serialize` | Write distinct serials to RTL-SDR dongles that share a serial |
+| `rfcensus list ...` | List dongles, antennas, bands, decoders, detectors, sessions, or emitters |
+
+**Runtime** – the actual scanning
+
+| Command | When to use |
+| --- | --- |
+| `rfcensus scan` | Quick discovery pass. *5 min default, single pass per band.* What's even at this site? |
+| `rfcensus inventory` | Exhaustive enumeration. *Defaults to forever.* Round-robins through every band repeatedly. Catches intermittent emitters. |
+| `rfcensus hybrid` | Inventory + decoder pinning. *Defaults to forever.* The only command that honors pinned dongles; the rest run the normal exploration scan. |
+| `rfcensus monitor BAND` | Watch one specific band live. Streams decodes to stdout. Used for narrow follow-up after `inventory` surfaces something interesting. |
+
+**Inspection** – looking at what was found
+
+| Command | What it does |
+| --- | --- |
+| `rfcensus list emitters` | Show all emitters tracked across sessions |
+| `rfcensus list detections` | Show detections from detectors (LoRa, P25, etc.) |
+| `rfcensus list sessions` | Recent session history |
+| `rfcensus diff SESSION_A SESSION_B` | What changed between two sessions |
+| `rfcensus baseline ...` | Manage long-lived reference sessions to diff against |
+| `rfcensus export ...` | Dump data as JSON, CSV, or text |
+
+## The three run modes
+
+The split is intentional and matches a natural workflow:
+
+• **`scan`** is the *discover* pass. You want to know what's at a site –
+  point rfcensus at your bands, give it five minutes, get a quick read.
+  Single-pass, finite by default. This is what you run when you arrive
+  at a new place.
+
+• **`inventory`** is the *enumerate* pass. Once you know roughly what's
+  there, you want catalogue completeness – every TPMS reading, every
+  weather station beacon, every paging burst. Intermittent emitters
+  (a security sensor that only chirps on events, paging that hits once
+  an hour) need long runs to catch. Inventory loops through bands
+  many times and defaults to running until you Ctrl-C.
+
+• **`hybrid`** is the *enumerate while watching specific things* pass.
+  When you've identified targets you want gap-free coverage of (the
+  weather station on 433.92, the utility meter reads on 912 MHz, the
+  Honeywell security sensors on 345 MHz), you pin those decoders to
+  specific dongles. The remaining dongles do the normal `inventory`
+  exploration. Defaults to forever.
+
+`monitor` is the focused fourth mode – one band, one decoder, live
+stream to stdout. Good for "let me actually watch what's happening on
+915 MHz right now" debugging or demos.
+
+For unattended runs, `--until-quiet 30m` is almost always what you
+actually want: keep running, but exit cleanly when no new emitter has
+been seen in the last 30 minutes.
+
+## Fleet coordination and antenna diversity
+
+This is where rfcensus earns its keep. A single SDR with a single
+antenna can only cover one frequency range well at a time, and
+retuning a telescopic whip is a hands-on operation. Once you have
+multiple dongles and a couple of antennas, you can cover wildly more
+of the spectrum *simultaneously* – and that's exactly the situation
+rfcensus is designed for.
+
+**The matcher.** Each antenna in your catalogue declares a usable
+frequency range (e.g. `whip_433` is good from 380–480 MHz). For each
+enabled band, rfcensus finds the (dongle, antenna) pair whose
+suitability score is highest. A 4-dongle setup with `whip_315`,
+`whip_433`, `whip_915`, and a `discone` covers TPMS through ISM
+through paging through 2m amateur *in parallel* – a single-dongle
+setup would have to retune four times and miss any bursts during the
+swap.
+
+**The scheduler.** Bands are packed into "waves" of tasks that can
+run together because they don't share dongles. Waves run sequentially.
+This guarantees the broker never sees an impossible "two consumers,
+one dongle" request, and it maximizes parallelism subject to your
+hardware reality.
+
+**`rfcensus suggest antennas`.** Given your fleet (whatever's plugged
+in), your enabled bands, and your antenna catalogue, the optimizer
+proposes the best assignment. It also identifies coverage gaps and
+suggests antennas to buy when no catalogue antenna would cover a
+particular band well. Run it whenever you change hardware, and it
+will tell you whether your current assignment is already optimal or
+whether a swap would help.
+
+**The setup wizard.** `rfcensus setup` walks you through every
+detected dongle, asks what antenna it has, and lets you pick from the
+catalogue, define a custom antenna inline, or say "I don't know" and
+get guided suggestions. Telescopic-whip users get explicit
+quarter-wave length recommendations in centimetres. The wizard
+preserves any existing config – re-run it any time you swap hardware
+and only the changed dongles get re-prompted.
+
+**Telescopic-whip + guided mode.** Single-dongle users with a
+telescopic whip can run `rfcensus inventory --guided` to get prompted
+between bands to retune the whip to the right length. The wizard
+shows you the cm to set, waits for confirmation, then proceeds.
+Single-pass only by design – round-robin would prompt dozens of
+times.
+
+**Duplicate serials.** RTL-SDR dongles ship with serial `00000001`
+out of the factory, and a fleet of unflashed dongles can't be
+distinguished. `rfcensus serialize` walks them through the
+re-serialization tool one at a time so each gets a unique ID.
+
+## Pinning and the `hybrid` command
+
+For most use cases, the scheduler does the right thing – it allocates
+dongles dynamically as the wave plan progresses. But sometimes you
+want to *guarantee* a specific dongle stays on a specific decoder for
+the whole session. Common reasons:
+
+• A weather station you want every beacon from, no gaps
+• A 24/7 utility-meter capture (rtlamr at 912 MHz) on a dongle that
+  should never be reassigned to other work
+• Two dongles with `whip_915`, one outdoor with better SNR – you want
+  rtl_433 traffic on the outdoor one specifically
+
+That's what pinning is for. Pinned dongles take a dedicated lease at
+session start, run their assigned decoder for the entire session, and
+are removed from the scheduler's pool. Pin failures retry forever
+(plateauing at 60s between attempts) so a USB hiccup or a brief
+decoder crash recovers automatically.
+
+```bash
+# Walk the wizard
+rfcensus pin
+
+# Or add directly
+rfcensus pin add 00000043:rtl_433@433.92M
+
+# Or as a one-session override
+rfcensus hybrid --pin 00000043:rtl_433@345M --pin 00000001:rtl_433@433.92M
+
+# Show what's currently pinned in your config
+rfcensus pin list
+
+# Remove a pin
+rfcensus pin remove 00000043
+```
+
+**Pinning is opt-in via the `hybrid` subcommand** – `scan` and
+`inventory` ignore pins on purpose. The footgun this prevents: a pin
+you set up months ago for an experiment shouldn't silently break a
+routine `inventory` scan because your dongle pool is suddenly two
+short. If pins are in your config and you run `inventory`, you get a
+one-line warning telling you they were ignored and pointing at
+`hybrid`.
+
+`hybrid` defaults to running until Ctrl-C, since the canonical use
+case is "pin some targets, walk away, come back." The
+indefinite-mode banner reminds you that `--duration 1h` or
+`--until-quiet 30m` are available when you want a finite run.
+
+## Common workflows
+
+**First-time setup at a new site**
+
+```bash
+rfcensus init                  # generate config
+rfcensus setup                 # assign antennas
+rfcensus suggest antennas      # check the assignment is optimal
+rfcensus doctor                # confirm everything healthy
+rfcensus scan --duration 5m    # quick read on what's around
+rfcensus list emitters         # see what was found
+```
+
+**Routine exhaustive inventory**
+
+```bash
+# Run until the site has been quiet for 30 min, then exit cleanly
+rfcensus inventory --until-quiet 30m
+
+# Or let it run for a bounded window
+rfcensus inventory --duration 4h
+```
+
+**Long-running pinned coverage**
+
+```bash
+# Set up persistent pins via wizard
+rfcensus pin
+# (walks dongles, asks what to pin to, writes site.toml)
+
+# Then run hybrid mode, which honors them
+rfcensus hybrid
+# Pinned dongles run forever; the rest do exploration
+```
+
+**Comparing sessions over time**
+
+```bash
+# Run an inventory and get its session ID
+rfcensus inventory --duration 1h
+
+# Look at what changed since last week's session
+rfcensus list sessions
+rfcensus diff <session_a> <session_b>
+
+# Or use the baseline machinery for a stable reference
+rfcensus baseline create my_normal_site
+# ...later...
+rfcensus baseline diff my_normal_site
+```
+
+**Following up on something interesting**
+
+After `inventory` surfaces an unknown carrier or a particularly noisy
+band, point a dongle at it directly:
+
+```bash
+rfcensus monitor 433_ism
+# Streams decodes live to stdout; --save to also persist them
+```
+
+## What's inside
+
+**Decoders** – `rtl_433`, `rtlamr`, `rtl-ais`, `multimon-ng`, `direwolf`.
+Each subprocess-invoked, so license isolation is clean and you only
+need the binaries for the decoders you use.
+
+**Detectors** – pattern-based recognizers that flag signals without
+needing a full decoder: `lora` (chirp detection), `p25` (control
+channel detection), `wifi_bt_ism` (WiFi + Bluetooth carriers in 2.4
+GHz ISM).
+
+**Default US band catalogue** (21 bands) – security/TPMS/keyfob (315,
+319.5, 345, 433.92), ISM (915), paging (929), AIS (162), APRS
+(144.39), NOAA weather, marine VHF, business VHF/UHF, P25 700/800,
+70cm amateur, ACARS (131), and a few more. The catalogue also defines
+a couple of bands rfcensus doesn't decode itself (ADS-B 1090, UAT
+978) – they ship as opt-in placeholders if you want to hand off to a
+specialized tool, but the mainstream ADS-B ecosystem (dump1090,
+readsb, tar1090, FlightAware) is what you want for that.
+Override or extend any of this in your `site.toml`.
+
+**Antenna catalogue** (8 antennas) – `whip_generic_small`, `whip_315`,
+`whip_433`, `whip_915`, `dipole_1090`, `discone`, `marine_vhf`,
+`magmount_800_900`. Define your own with custom resonant frequency
+and usable range for anything not in the catalogue.
+
+**Persistence** – SQLite at `~/.local/share/rfcensus/sessions.db`.
+Tables for sessions, dongles, decodes, emitters, detections, active
+channels, anomalies, power samples, and baselines. Retention windows
+configurable in site.toml.
 
 ## Hardware prerequisites
 
@@ -63,9 +389,9 @@ You need at least one of the following:
 • HackRF One
 • Anything that speaks to librtlsdr or hackrf tools
 
-You'll also need the underlying decoder tools installed. The easiest
-path is `./scripts/install_decoders.sh` (see above), which handles all
-of this. To install manually:
+You'll also need the underlying decoder binaries installed. The
+easiest path is `./scripts/install_decoders.sh` which handles all of
+this. To install manually:
 
 ```bash
 # Debian/Ubuntu
@@ -73,13 +399,13 @@ sudo apt install rtl-433 rtl-sdr multimon-ng
 # Optional for more protocols:
 sudo apt install direwolf
 
-# rtlamr (Go) — we recommend the jstockdale fork, which carries
+# rtlamr (Go) – we recommend the jstockdale fork, which carries
 # a small r900 performance patch (~35× faster in the no-traffic
 # case). The patch is intended for upstream; until then, the fork
 # is what rfcensus tests against.
 go install github.com/jstockdale/rtlamr@latest
 # (upstream github.com/bemasher/rtlamr works too, just slower for
-# r900 coverage — see scripts/install_decoders.sh for why)
+# r900 coverage – see scripts/install_decoders.sh for why)
 
 # rtl-ais – install separately, or build from source:
 # https://github.com/dgiardini/rtl-ais
@@ -90,26 +416,66 @@ sudo apt install hackrf
 
 Run `rfcensus doctor` and it will tell you what's missing.
 
+## Where things live
+
+| Path | What it is |
+| --- | --- |
+| `~/.config/rfcensus/site.toml` | Your site config (dongles, antennas, bands, pins) |
+| `~/.local/share/rfcensus/sessions.db` | SQLite database with all session data |
+| `~/.local/state/rfcensus/rfcensus.log` | Default log file (override with `--logfile`) |
+
+All three follow XDG conventions and can be moved by setting the
+relevant `XDG_*_HOME` environment variables.
+
+## Privacy and safety
+
+**Hashing is on by default.** Device IDs in reports and the database
+are hashed with a per-site salt generated at `init` time. To see raw
+IDs in reports, pass `--include-ids`. The salt is in your site.toml
+and never leaves your machine.
+
+**Passive monitoring only.** rfcensus listens; it never transmits.
+Decoders that could in principle transmit (HackRF, hardware that
+supports it) are used in receive mode only.
+
+**Encrypted protocols are identified, not decrypted.** P25 phase 1
+trunk control channels are detected and reported; the encrypted
+voice payload is not. LoRa chirps are detected and characterized;
+the encrypted payload is not. Detection is legal; decryption isn't.
+
+**Legally-conservative by default.** The defaults steer you toward
+common ISM and amateur bands plus public-safety identification (not
+decoding). If you want to push into more sensitive territory, you
+have to explicitly enable bands and accept that your local laws are
+your responsibility.
+
 ## Design principles
 
-1. **Progressive disclosure**: Default usage is simple. Expert users can drill in.
-2. **Hardware-adaptive**: Does best job possible with whatever hardware is
-   available. One RTL-SDR or a rack of gear, both work.
-3. **Privacy-preserving by default**: IDs are hashed. Opt in to raw values.
-4. **Legally-conservative**: Passive monitoring only. Encrypted protocols are
-   identified but not decoded.
-5. **Specialization hand-off**: For things that need specialized tooling
-   (satellite imagery, trunked P25), we identify and hand off rather than
-   reimplement.
+1. **Progressive disclosure** – Default usage is simple. Expert users
+   can drill in.
+2. **Hardware-adaptive** – Does the best job possible with whatever
+   hardware is available. One RTL-SDR or a rack of gear, both work.
+3. **Privacy-preserving by default** – IDs are hashed. Opt in to raw
+   values.
+4. **Legally-conservative** – Passive monitoring only. Encrypted
+   protocols are identified but not decoded.
+5. **Specialization hand-off** – For things that need specialized
+   tooling (satellite imagery, trunked P25 voice), we identify and
+   hand off rather than reimplement.
+6. **Footgun mitigation** – Surprising defaults are out, predictable
+   ones are in. Pinning is opt-in via `hybrid`. Indefinite runs print
+   a banner reminding you of finite alternatives. Antenna mismatches
+   on pins fail loudly rather than silently.
 
 ## License
 
 BSD-3-Clause. See LICENSE.
 
-Underlying decoder tools have their own licenses (rtl_433 is GPL-2.0, rtlamr is
-AGPL-3.0, multimon-ng is GPL-2.0, etc.). rfcensus subprocess-invokes these tools
-and does not link against them, so the BSD license applies to rfcensus itself.
+Underlying decoder tools have their own licenses (rtl_433 is
+GPL-2.0, rtlamr is AGPL-3.0, multimon-ng is GPL-2.0, etc.). rfcensus
+subprocess-invokes these tools and does not link against them, so
+the BSD license applies to rfcensus itself.
 
 ## Project
 
-rfcensus is an Off by One project.
+rfcensus is a project by @jstockdale and Off by One.
