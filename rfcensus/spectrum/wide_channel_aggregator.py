@@ -296,6 +296,26 @@ class WideChannelAggregator:
         # flooding.
         self._last_bin_count_warn: float = 0.0
         self._last_scan_duration_warn: float = 0.0
+        # v0.6.5: LoRa-detection diagnostics. When a user reports "no
+        # LoRa detections even though there's definitely traffic", we
+        # want to know where the pipeline dropped the signal. These
+        # counters are reset at start() and emitted at stop() as a
+        # diagnostic summary, so users can see:
+        #   • scans_run: did the scanner even run?
+        #   • scans_with_bins: was there any activity to look at?
+        #   • template_matches_considered: did any span match a
+        #     template bandwidth (125/250/500 kHz)?
+        #   • coverage_failed / simultaneity_failed: which filter
+        #     rejected the matches? This is the key signal for
+        #     diagnosing rtl_power-sweep-vs-LoRa-burst mismatch.
+        #   • emissions: how many WideChannelEvents actually fired.
+        self._diag_scans_run: int = 0
+        self._diag_scans_with_bins: int = 0
+        self._diag_template_matches_considered: int = 0
+        self._diag_coverage_failed: int = 0
+        self._diag_simultaneity_failed: int = 0
+        self._diag_bandwidth_failed: int = 0
+        self._diag_emissions: int = 0
 
     async def observe(
         self,
@@ -407,6 +427,26 @@ class WideChannelAggregator:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await self._scanner_task
         self._scanner_task = None
+        # v0.6.5: emit diagnostic summary so users can tell whether
+        # the aggregator found LoRa composites or rejected them at
+        # each filter stage. Critical for diagnosing "no LoRa
+        # detections despite known traffic" — the ratios reveal
+        # whether the signal never matched a template (bandwidth
+        # or coverage filter), or did match but failed simultaneity
+        # (rtl_power sweep vs. LoRa burst timing mismatch).
+        log.info(
+            "wide-channel aggregator diagnostics: "
+            "scans=%d scans_with_bins=%d template_matches=%d "
+            "bandwidth_fail=%d coverage_fail=%d simultaneity_fail=%d "
+            "emitted=%d",
+            self._diag_scans_run,
+            self._diag_scans_with_bins,
+            self._diag_template_matches_considered,
+            self._diag_bandwidth_failed,
+            self._diag_coverage_failed,
+            self._diag_simultaneity_failed,
+            self._diag_emissions,
+        )
         log.info("wide-channel scanner task stopped")
 
     async def _scanner_loop(self, interval_s: float) -> None:
@@ -475,9 +515,11 @@ class WideChannelAggregator:
         perspective, which was the root cause of the v0.5.43-era
         decoder-fanout cascade.
         """
+        self._diag_scans_run += 1
         self._prune_stale(now)
         if not self._bins:
             return
+        self._diag_scans_with_bins += 1
 
         # v0.5.44: instrument unusual bin counts. A 26 MHz rtl_power
         # scan at 25 kHz bins has ~1040 total bins; in a quiet band
@@ -701,10 +743,13 @@ class WideChannelAggregator:
             )
             span_err = abs(actual_span - template_hz) / template_hz
             if span_err > self.bandwidth_tolerance:
+                self._diag_bandwidth_failed += 1
                 continue
 
+            self._diag_template_matches_considered += 1
             coverage = len(in_span) / bins_per_template
             if coverage < self.coverage_threshold:
+                self._diag_coverage_failed += 1
                 continue
 
             # v0.5.40: temporal simultaneity. The bins must all have
@@ -716,6 +761,7 @@ class WideChannelAggregator:
             # reasoning (tl;dr: rtl_power scans bins at ~1 Hz, so
             # "active in 5s" is NOT "simultaneously active").
             if not self._is_simultaneous(in_span):
+                self._diag_simultaneity_failed += 1
                 continue
 
             composite_center = (in_span[0] + in_span[-1]) // 2
@@ -766,6 +812,7 @@ class WideChannelAggregator:
         return spread <= self.simultaneity_window_s
 
     async def _emit_candidate(self, cand, now: datetime) -> None:
+        self._diag_emissions += 1
         await self._emit_composite(
             in_span=cand.in_span,
             template_hz=cand.template_hz,

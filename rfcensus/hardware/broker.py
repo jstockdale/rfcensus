@@ -66,6 +66,19 @@ class DongleRequirements:
     prefer_wide_scan: bool = False
     # If true, broker tries to select a dongle whose current antenna covers freq_hz
     require_suitable_antenna: bool = True
+    # v0.6.4: optional band identifier (e.g. "915_ism") so the broker
+    # can include it in the HardwareEvent it publishes on allocate.
+    # Purely informational — doesn't affect dongle selection. The TUI
+    # uses it to label which band each dongle is currently scanning.
+    band_id: str | None = None
+    # v0.6.9: if True, joining an existing shared slot requires
+    # slot.sample_rate == sample_rate exactly. Set by decoders whose
+    # demod math hardcodes a specific rate (rtlamr's 2,359,296 Hz).
+    # Belt-and-suspenders: the band-level rate picker should ensure
+    # all decoders on a band agree on the rate up front, but if the
+    # rate ends up wrong somehow, this gate fails the allocation
+    # loudly instead of silently joining a wrong-rate slot.
+    require_exact_sample_rate: bool = False
 
 
 @dataclass
@@ -130,16 +143,26 @@ SHARED_SLOT_BANDWIDTH_FRACTION = 0.8
 
 
 def _shared_slot_compatible(
-    slot: "_SharedSlot", req_freq_hz: int, req_sample_rate: int
+    slot: "_SharedSlot", req_freq_hz: int, req_sample_rate: int,
+    *, require_exact_rate: bool = False,
 ) -> bool:
     """Can a new shared consumer at req_freq_hz join this slot?
 
-    Must satisfy both:
+    Must satisfy:
       • Slot's sample rate >= requested (we can't provide more resolution
         than what rtl_tcp was started with)
+      • If require_exact_rate is True: slot.sample_rate must EQUAL
+        the requested rate. v0.6.9 gate for rtlamr-style decoders
+        whose demod math hardcodes a specific rate — joining a slot
+        at a different rate would silently produce wrong-clock
+        output. The band-level rate picker should ensure this never
+        triggers in production (everyone agrees on the rate up front)
+        but the gate prevents accidental misuse.
       • Requested frequency within slot's usable bandwidth window
     """
     if slot.sample_rate < req_sample_rate:
+        return False
+    if require_exact_rate and slot.sample_rate != req_sample_rate:
         return False
     half_window = SHARED_SLOT_BANDWIDTH_FRACTION * slot.sample_rate / 2
     return abs(req_freq_hz - slot.center_freq_hz) <= half_window
@@ -157,6 +180,31 @@ class DongleBroker:
         self._exclusive_holders: dict[str, int] = {}  # dongle.id → lease_id
         self._next_lease_id = 1
         self._next_tcp_port = 1234
+
+    def active_lease_count(self, dongle_id: str) -> int:
+        """v0.6.9: how many other live leases does this dongle have?
+
+        Used by the strategy layer's hardware-loss heuristic: a decoder
+        exiting in <5s with 0 decodes USUALLY means hardware vanished,
+        but if some OTHER consumer is still happily holding a lease on
+        the same dongle, the dongle is clearly alive — this exit is a
+        decoder-specific issue (e.g. fanout disconnected the client
+        for a command conflict in shared-mode filtering).
+
+        Returns 0 if there are no leases at all (dongle is unallocated
+        or already released). Otherwise the count includes both the
+        shared-slot lease set and the exclusive holder if any.
+
+        Cheap — just dict lookups, no async, safe to call from the
+        strategy layer's post-decoder cleanup path.
+        """
+        count = 0
+        slot = self._shared_slots.get(dongle_id)
+        if slot is not None:
+            count += len(slot.lease_ids)
+        if dongle_id in self._exclusive_holders:
+            count += 1
+        return count
 
     async def allocate(
         self,
@@ -181,6 +229,11 @@ class DongleBroker:
                         dongle_id=dongle.id,
                         kind="allocated",
                         detail=f"lease {allocated_lease._lease_id} for {consumer}",
+                        # v0.6.4: structured fields for TUI consumption.
+                        freq_hz=requirements.freq_hz,
+                        sample_rate=requirements.sample_rate,
+                        consumer=consumer,
+                        band_id=requirements.band_id,
                     )
             # Publish OUTSIDE the lock to avoid the deadlock pattern
             # described in release().
@@ -231,7 +284,8 @@ class DongleBroker:
                 # effectively locked to its original user.
                 slot = self._shared_slots.get(dongle.id)
                 if slot and not _shared_slot_compatible(
-                    slot, req.freq_hz, req.sample_rate
+                    slot, req.freq_hz, req.sample_rate,
+                    require_exact_rate=req.require_exact_sample_rate,
                 ):
                     continue
             if req.require_suitable_antenna and dongle.antenna is not None:
@@ -269,7 +323,8 @@ class DongleBroker:
                 # when one could serve multiple decoders. Only compatible
                 # counts — a slot at a different frequency doesn't help.
                 if slot and _shared_slot_compatible(
-                    slot, req.freq_hz, req.sample_rate
+                    slot, req.freq_hz, req.sample_rate,
+                    require_exact_rate=req.require_exact_sample_rate,
                 ):
                     has_matching_slot = 1
             return (has_matching_slot, antenna_score, driver_score, wide_score)
@@ -393,6 +448,21 @@ class DongleBroker:
             downstream_host="127.0.0.1",
             downstream_port=fanout_port,
             slot_label=f"fanout[{dongle.id}]",
+            # v0.6.4: pass the broker's event bus so the fanout can
+            # publish FanoutClientEvent on connect/disconnect/slow.
+            # Subscribers consume in v0.7.0+ (the TUI dashboard);
+            # for now the events flow but go nowhere.
+            event_bus=self.event_bus,
+            # v0.6.8: lock the fanout to the upstream's tuned values
+            # so client retune commands that would corrupt the shared
+            # stream are filtered (idempotent matches absorbed,
+            # mismatches disconnect the offending client). This was
+            # the smoking-gun fix for the "rtl_433 dies after
+            # lora_survey detection" bug — though that bug's primary
+            # cause was DSP blocking the asyncio loop, the secondary
+            # cause was decoders fighting over upstream tuning.
+            upstream_sample_rate=sample_rate,
+            upstream_center_freq_hz=center_freq_hz,
         )
         last_err: Exception | None = None
         _FANOUT_START_RETRIES = 4
@@ -500,6 +570,11 @@ class DongleBroker:
                 dongle_id=dongle.id,
                 kind="released",
                 detail=f"lease {lease_id} from {lease.consumer}",
+                # v0.6.4: surface the consumer so the TUI can correlate
+                # the release with the previous "allocated" event for
+                # the same lease. freq/sample_rate aren't carried on
+                # release because the dongle is no longer tuned.
+                consumer=lease.consumer,
             )
 
         # Publish OUTSIDE the lock so a slow subscriber can't deadlock us.
@@ -519,6 +594,81 @@ class DongleBroker:
             self._shared_slots.clear()
             self._exclusive_holders.clear()
             self._leases.clear()
+
+    # ────────────────────────────────────────────────────────────────
+    # v0.6.5: pause/resume coordination across all shared fanouts
+    # ────────────────────────────────────────────────────────────────
+
+    def pause_all_fanouts(self) -> None:
+        """Quick-pause every active shared fanout.
+
+        Each fanout stops distributing IQ chunks to its downstream
+        clients while continuing to drain rtl_tcp upstream. Decoders
+        block on their socket reads. No restart cost on resume.
+
+        Called by SessionControl.pause() when the user hits `p`.
+        Idempotent: pause_all_fanouts() then pause_all_fanouts() is
+        the same as one call.
+
+        Sync because fanout.pause_writes is sync. Iterates all slots
+        without taking the broker lock — adding/removing slots while
+        a pause is in flight is safe (already-paused slots stay
+        paused, new slots start unpaused which is correct).
+        """
+        n_paused = 0
+        for slot in self._shared_slots.values():
+            if slot.fanout is not None:
+                slot.fanout.pause_writes()
+                n_paused += 1
+        if n_paused > 0:
+            log.info("paused %d fanout(s)", n_paused)
+
+    def resume_all_fanouts(self) -> dict[str, bool]:
+        """Resume every paused fanout. Returns {dongle_id: all_alive}
+        per slot — False entries indicate a fanout where one or more
+        downstream clients died during pause and need restart by the
+        caller (the deep-pause / quick-pause-with-crash path).
+        """
+        results: dict[str, bool] = {}
+        for dongle_id, slot in self._shared_slots.items():
+            if slot.fanout is not None:
+                results[dongle_id] = slot.fanout.resume_writes()
+        n = len(results)
+        n_alive = sum(1 for ok in results.values() if ok)
+        if n > 0:
+            log.info(
+                "resumed %d fanout(s), %d with all clients alive",
+                n, n_alive,
+            )
+        return results
+
+    def deep_pause_teardown_fanouts(self) -> int:
+        """v0.6.5 deep-pause: close downstream client connections on
+        every shared fanout. Decoders exit on socket EOF. Upstream
+        rtl_tcp + lease stay alive so the dongle isn't released to
+        other consumers while paused.
+
+        Returns total number of clients disconnected. Called from the
+        deep_pause_watcher callback when pause crosses 20s.
+        """
+        total = 0
+        for slot in self._shared_slots.values():
+            if slot.fanout is not None:
+                total += slot.fanout.disconnect_all_clients()
+        if total > 0:
+            log.info(
+                "deep-pause: disconnected %d total downstream client(s) "
+                "across %d fanout(s)",
+                total, len(self._shared_slots),
+            )
+        return total
+
+    @property
+    def shared_slot_dongle_ids(self) -> list[str]:
+        """List of dongle IDs that currently have a shared fanout
+        running. Used by the deep-pause path to know which dongles to
+        tear down (vs. leave alone)."""
+        return list(self._shared_slots.keys())
 
 
 def _pick_free_port(start: int = 1234) -> int:

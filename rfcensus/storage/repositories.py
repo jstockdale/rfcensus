@@ -35,6 +35,26 @@ def _dt(text: str) -> datetime:
     return datetime.fromisoformat(text)
 
 
+def _maybe_int(row, column: str) -> int | None:
+    """Return row[column] as int, or None if the column is absent or NULL.
+
+    Defensive accessor used when reading columns added by later schema
+    migrations — on a database that was last touched by a pre-migration
+    binary, or if the row was INSERTed before the column existed, the
+    column may legitimately be NULL (ALTER TABLE ADD COLUMN behavior).
+    Indexing SQLite Row by a missing column name raises IndexError;
+    indexing a present-but-NULL column returns None cleanly, so the
+    try/except is only defense against the truly-missing case.
+    """
+    try:
+        value = row[column]
+    except (IndexError, KeyError):
+        return None
+    if value is None:
+        return None
+    return int(value)
+
+
 # ------------------------------------------------------------
 # Sessions
 # ------------------------------------------------------------
@@ -278,6 +298,7 @@ class ActiveChannelRepo:
                     noise_floor_dbm = ?,
                     classification = ?,
                     persistence_ratio = ?,
+                    sample_count = ?,
                     confidence = ?,
                     metadata = ?
                 WHERE id = ?
@@ -289,6 +310,7 @@ class ActiveChannelRepo:
                     record.noise_floor_dbm,
                     record.classification,
                     record.persistence_ratio,
+                    record.sample_count,
                     record.confidence,
                     json_dumps(record.metadata),
                     record.id,
@@ -301,8 +323,8 @@ class ActiveChannelRepo:
             INSERT INTO active_channels
                 (session_id, freq_center_hz, bandwidth_hz, first_seen, last_seen,
                  peak_power_dbm, avg_power_dbm, noise_floor_dbm, classification,
-                 persistence_ratio, confidence, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 persistence_ratio, sample_count, confidence, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record.session_id,
@@ -315,6 +337,7 @@ class ActiveChannelRepo:
                 record.noise_floor_dbm,
                 record.classification,
                 record.persistence_ratio,
+                record.sample_count,
                 record.confidence,
                 json_dumps(record.metadata),
             ),
@@ -363,6 +386,7 @@ class ActiveChannelRepo:
             noise_floor_dbm=row["noise_floor_dbm"],
             classification=row["classification"],
             persistence_ratio=row["persistence_ratio"],
+            sample_count=_maybe_int(row, "sample_count"),
             confidence=row["confidence"],
             metadata=json_loads(row["metadata"]) or {},
         )
@@ -385,6 +409,7 @@ class ActiveChannelRepo:
                 noise_floor_dbm=row["noise_floor_dbm"],
                 classification=row["classification"],
                 persistence_ratio=row["persistence_ratio"],
+                sample_count=_maybe_int(row, "sample_count"),
                 confidence=row["confidence"],
                 metadata=json_loads(row["metadata"]) or {},
             )

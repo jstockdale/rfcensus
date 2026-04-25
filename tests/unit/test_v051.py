@@ -159,11 +159,15 @@ class TestCommandDefaults:
         assert per_band_opt.default == "1m"
 
     def test_inventory_duration_longer_than_scan(self):
+        """v0.6.1: inventory now defaults to 'forever' (exhaustive
+        enumeration; intermittent emitters need long runs to catch),
+        scan stays finite at 5m. The semantic split: scan to discover,
+        inventory to enumerate."""
         from rfcensus.commands.inventory import cli_inventory, cli_scan
         scan_dur = next(p for p in cli_scan.params if p.name == "duration").default
         inv_dur = next(p for p in cli_inventory.params if p.name == "duration").default
         assert scan_dur == "5m"
-        assert inv_dur == "1h"
+        assert inv_dur == "forever"
 
 
 # ──────────────────────────────────────────────────────────────────

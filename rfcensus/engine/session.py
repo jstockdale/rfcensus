@@ -15,7 +15,7 @@ from rfcensus.engine.dispatcher import Dispatcher
 from rfcensus.engine.scheduler import ExecutionPlan, Scheduler, ScheduleTask
 from rfcensus.engine.strategy import StrategyContext, StrategyResult
 from rfcensus.events import DecodeEvent, EventBus, SessionEvent
-from rfcensus.hardware.broker import DongleBroker
+from rfcensus.hardware.broker import DongleBroker, NoDongleAvailable
 from rfcensus.hardware.health import check_all
 from rfcensus.hardware.registry import HardwareRegistry
 from rfcensus.storage import (
@@ -99,6 +99,12 @@ class SessionRunner:
         before_task_hook: callable | None = None,
         after_session_hook: callable | None = None,
         skip_health_check: bool = False,
+        # v0.6.0: decoder pinning. If pin_specs is non-empty, those
+        # dongles are leased exclusively at session bootstrap and a
+        # supervised decoder loop runs on each for the session lifetime.
+        # The scheduler never sees them. See engine/pinning.py.
+        pin_specs: list | None = None,
+        allow_pin_antenna_mismatch: bool = False,
     ):
         # Hooks for interactive modes like --guided. before_task_hook
         # is called before each task starts; if it returns "skip" the
@@ -126,6 +132,13 @@ class SessionRunner:
         self.max_dongle_failures = max_dongle_failures
         self.event_bus = EventBus()
         self.broker = DongleBroker(registry, self.event_bus)
+        # v0.6.5: pause/resume coordination. Created here so the TUI
+        # (or any other controller) can grab a reference via
+        # `runner.control` and toggle pause without going through the
+        # session loop. The wave loop and fanouts both consult this
+        # object — see engine/session_control.py for full lifecycle.
+        from rfcensus.engine.session_control import SessionControl
+        self.control = SessionControl()
         # Set by the SIGINT handler installed during run(). Checked between
         # waves and between passes for graceful shutdown.
         self._stop_requested = False
@@ -135,6 +148,11 @@ class SessionRunner:
         # dongle reconnects.
         self._pending_retries: list[_PendingRetry] = []
         self._sidecar_tasks: set[asyncio.Task] = set()
+        # v0.6.5: deep-pause watcher task. Tracked separately from
+        # _sidecar_tasks because it's an infinite loop — the sidecar
+        # cleanup gather would block forever waiting for it. Cancelled
+        # explicitly during session teardown.
+        self._deep_pause_task: asyncio.Task | None = None
         # Per-dongle failure counter — if >= max_dongle_failures, the
         # dongle is added to _permanently_failed and re-probe will not
         # restore it for the rest of the session.
@@ -151,15 +169,14 @@ class SessionRunner:
         self._ctx = None
         # Map band id → BandConfig for quick lookup from event handlers
         self._band_by_id: dict[str, object] = {}
-        # v0.5.41: confirmation queue. LoRa (and potentially other)
-        # detectors emit DetectionEvents flagged needs_iq_confirmation=True
-        # during discovery; the DetectionWriter auto-submits those to
-        # this queue. Between waves (in the execution loop below) we
-        # inspect the queue and fill any wave's idle dongle slots with
-        # confirmation clusters. Populated by DetectionWriter in real
-        # time as discovery runs.
-        from rfcensus.engine.confirmation_queue import ConfirmationQueue
-        self._confirmation_queue = ConfirmationQueue()
+
+        # v0.6.0: pinning state. List of PinSpec objects (or empty),
+        # parsed from config + CLI by the calling command. The actual
+        # PinningOutcome (with live supervisor tasks) is built during
+        # run() and stashed on self._pinning_outcome for teardown.
+        self._pin_specs = list(pin_specs or [])
+        self._allow_pin_antenna_mismatch = allow_pin_antenna_mismatch
+        self._pinning_outcome = None  # set in run() after start_pinned_tasks
 
     def _handle_sigint(self) -> None:
         """SIGINT handler installed during run().
@@ -311,427 +328,12 @@ class SessionRunner:
         return elapsed >= self.until_quiet_s
 
     # ------------------------------------------------------------
-    # v0.5.41: LoRa confirmation integration
+    # v0.6.6: confirmation queue removed. The legacy LoRa detector
+    # was the only producer; LoraSurveyTask does its own IQ analysis
+    # inline via survey_iq_window, so deferred confirmation is no
+    # longer needed. If a future detector wants the same pattern,
+    # reintroduce a fresh queue scoped to that detector's needs.
     # ------------------------------------------------------------
-
-    def _augment_wave_with_confirmations(self, wave, detection_repo) -> None:
-        """Add confirmation-cluster tasks to this wave for any idle
-        dongle slots where the confirmation queue has matching work.
-
-        Called once per wave, just before execution. Does NOT grow
-        the wave past its natural size — we only fill slots that
-        would otherwise be idle (not reserved for primary tasks).
-
-        Matching criteria:
-          • Dongle covers the cluster's freq range (dongle.covers(freq))
-          • Dongle's antenna matches the cluster's band reasonably
-            (delegated to the wave planner's antenna matcher)
-          • Dongle is not already reserved by this wave's primary tasks
-
-        Each confirmation cluster gets scheduled against exactly one
-        dongle and becomes a ScheduleTask with confirmation_cluster
-        set. The normal _run_task dispatch picks this up and routes
-        to _run_confirmation_task.
-        """
-        if not self._confirmation_queue.has_work():
-            return
-
-        # Which dongles are already reserved by this wave's primary
-        # tasks? Walk the wave's existing tasks and collect their
-        # suggested dongles; these are unavailable for confirmation.
-        reserved: set[str] = set()
-        for task in wave.tasks:
-            if task.suggested_dongle_id is not None:
-                reserved.add(task.suggested_dongle_id)
-
-        # Usable dongles minus reserved = idle pool for this wave
-        usable = self.registry.usable()
-        idle_dongles = [d for d in usable if d.id not in reserved]
-        if not idle_dongles:
-            return
-
-        # For each idle dongle, try to match a cluster from the queue.
-        # Greedy: first compatible match wins. Clusters already used
-        # in this wave are tracked so we don't schedule the same
-        # cluster on two dongles.
-        added = 0
-        scheduled_clusters: list[object] = []
-
-        for dongle in idle_dongles:
-            # Cluster compatibility: the cluster's center must be
-            # within the dongle's tuning range.
-            # Use registry's covers() helper — same check as
-            # Scheduler.plan() uses for primary bands.
-            if not hasattr(dongle, "covers"):
-                continue
-            candidates = self._confirmation_queue.clusters_in_range(
-                freq_low=int(getattr(dongle, "freq_low", 0) or 0),
-                freq_high=int(
-                    getattr(dongle, "freq_high", 0) or 10_000_000_000
-                ),
-            )
-            if not candidates:
-                continue
-
-            # Skip clusters already scheduled for earlier dongles in
-            # this wave (avoid double-booking)
-            for cluster in candidates:
-                if id(cluster) in {id(c) for c in scheduled_clusters}:
-                    continue
-                # Synthesize a BandConfig-like marker so the task's
-                # antenna / wave-loop code has something to reference.
-                # We don't need the full BandConfig API — just an id
-                # and center_hz for logging.
-                from rfcensus.config.schema import BandConfig
-                synthetic_band = BandConfig(
-                    id=f"confirm_{cluster.center_freq_hz // 1000}khz",
-                    name=f"LoRa confirmation @ {cluster.center_freq_hz/1e6:.3f} MHz",
-                    freq_low=cluster.min_freq_hz,
-                    freq_high=cluster.max_freq_hz,
-                    strategy="decoder_only",  # any valid value; unused for this path
-                    effective_power_scan_bin_hz=25_000,
-                )
-                task = ScheduleTask(
-                    band=synthetic_band,
-                    suggested_dongle_id=dongle.id,
-                    suggested_antenna_id=(
-                        dongle.antenna.id if dongle.antenna else None
-                    ),
-                    dongles_needed=1,
-                    confirmation_cluster=cluster,
-                )
-                wave.tasks.append(task)
-
-                # Mark all tasks in this cluster as scheduled (remove
-                # from pending) to prevent another wave from picking
-                # them up.
-                # Run this synchronously on the asyncio loop
-                import asyncio as _asyncio
-                try:
-                    _asyncio.get_event_loop().create_task(
-                        self._confirmation_queue.mark_scheduled(cluster)
-                    )
-                except Exception:
-                    pass
-
-                scheduled_clusters.append(cluster)
-                added += 1
-                break  # one cluster per idle dongle
-
-        if added:
-            log.info(
-                "v0.5.41: filled %d idle slot(s) in wave %d with "
-                "LoRa confirmation cluster(s); queue status: %s",
-                added, wave.index,
-                self._confirmation_queue.status_line(),
-            )
-
-    async def _run_confirmation_task(self, task, detection_repo):
-        """Execute a confirmation cluster using an allocated lease.
-
-        Follows the same lease-allocation pattern as primary strategies,
-        but uses capture_with_lease() since we need multiple sub-captures
-        on the same dongle over the task's listening window.
-        """
-        from rfcensus.engine.confirmation_task import run_batched_confirmation
-        from rfcensus.engine.dongle_broker import AccessMode, DongleRequirements
-        from rfcensus.spectrum import IQCaptureService
-
-        cluster = task.confirmation_cluster
-        if cluster is None:
-            return StrategyResult(
-                band_id=task.band.id,
-                errors=["no confirmation cluster attached"],
-            )
-
-        iq_service = IQCaptureService(self.broker)
-
-        requirements = DongleRequirements(
-            freq_hz=cluster.center_freq_hz,
-            sample_rate=cluster.sample_rate,
-            access_mode=AccessMode.EXCLUSIVE,
-            prefer_driver="rtlsdr",
-        )
-
-        lease = None
-        confirmed_ids: set[int] = set()
-        try:
-            try:
-                lease = await self.broker.allocate(
-                    requirements,
-                    consumer=f"lora_confirmation:{cluster.center_freq_hz//1000}khz",
-                    timeout=5.0,
-                )
-            except Exception as exc:
-                log.warning(
-                    "confirmation task: failed to allocate dongle for "
-                    "%s: %s. Queue entries restored to pending for next wave.",
-                    cluster.describe(), exc,
-                )
-                # Return cluster to pending so it might get retried
-                # in a later wave
-                async with self._confirmation_queue._lock:
-                    for t in cluster.tasks:
-                        self._confirmation_queue._pending[t.dedup_key] = t
-                    self._confirmation_queue._in_flight.discard(id(cluster))
-                return StrategyResult(
-                    band_id=task.band.id,
-                    errors=[f"lease allocation failed: {exc}"],
-                )
-
-            # Progress callback — emit to stderr so it's visible
-            def _progress(msg: str) -> None:
-                import click
-                try:
-                    click.echo(msg, err=True)
-                except Exception:
-                    pass
-
-            confirmed_ids = await run_batched_confirmation(
-                cluster=cluster,
-                lease=lease,
-                iq_service=iq_service,
-                detection_repo=detection_repo,
-                session_id=self._current_session_id if hasattr(
-                    self, "_current_session_id"
-                ) else 0,
-                progress_cb=_progress,
-                survey_cb=lambda hit: asyncio.get_event_loop().create_task(
-                    self._emit_survey_hit(hit, detection_repo)
-                ),
-            )
-        finally:
-            if lease is not None:
-                try:
-                    await self.broker.release(lease)
-                except Exception:
-                    log.exception("error releasing confirmation lease")
-            await self._confirmation_queue.mark_completed(
-                cluster, confirmed_ids
-            )
-
-        return StrategyResult(
-            band_id=task.band.id,
-            decodes_emitted=len(confirmed_ids),
-        )
-
-    async def _emit_survey_hit(self, hit, detection_repo) -> None:
-        """v0.5.42: handle a SurveyHit from in-window opportunistic survey.
-
-        A SurveyHit is a LoRa-like signal the wideband IQ revealed that
-        the bin-based aggregator missed (typically a sparse channel
-        whose bursts happened during sweep gaps). Treat it as a
-        confirmed detection — we already have IQ-validated chirp
-        evidence, so insert directly with full SF/variant/channel
-        metadata, no further confirmation queue trip needed.
-        """
-        from datetime import datetime, timezone
-        from rfcensus.detectors.builtin.lora import (
-            _estimate_sf_from_slope,
-            _label_variant,
-        )
-        from rfcensus.spectrum.channel_plans import match_channel
-        from rfcensus.storage.models import DetectionRecord
-
-        analysis = hit.chirp_analysis
-        sf = _estimate_sf_from_slope(
-            slope_hz_per_sec=analysis.mean_slope_hz_per_sec,
-            bandwidth_hz=hit.bandwidth_hz,
-        )
-        variant = (
-            _label_variant(sf=sf, bandwidth_hz=hit.bandwidth_hz)
-            if sf is not None else None
-        )
-        channel_match = match_channel(
-            freq_hz=hit.freq_hz, bandwidth_hz=hit.bandwidth_hz,
-        )
-        # Default tech to "lora"; channel match upgrades to "lorawan"
-        # when the freq/BW lands on a LoRaWAN grid channel
-        technology = "lora"
-        if channel_match and channel_match.plan.startswith("lorawan_"):
-            technology = "lorawan"
-        elif channel_match and channel_match.plan.startswith("meshtastic_"):
-            technology = "lora"  # Meshtastic is technically LoRa-PHY
-
-        record = DetectionRecord(
-            id=None,
-            session_id=self._current_session_id,
-            detector="lora",
-            technology=technology,
-            freq_hz=hit.freq_hz,
-            bandwidth_hz=hit.bandwidth_hz,
-            confidence=min(1.0, 0.6 + 0.2 * (analysis.chirp_confidence or 0.0)),
-            evidence=(
-                f"in-window IQ survey: {analysis.num_chirp_segments} chirp "
-                f"segments, slope {analysis.mean_slope_hz_per_sec/1e3:.0f} kHz/s, "
-                f"SNR {hit.snr_db:.1f} dB"
-            ),
-            hand_off_tools=[],
-            detected_at=datetime.now(timezone.utc),
-            metadata={
-                "discovery_method": "in_window_iq_survey",
-                "needs_iq_confirmation": False,  # already confirmed
-                "iq_confirmed": True,
-                "estimated_sf": sf,
-                "variant": variant,
-                "chirp_confidence": float(analysis.chirp_confidence),
-                "mean_slope_hz_per_sec": float(analysis.mean_slope_hz_per_sec),
-                "snr_db": analysis.snr_db,
-                "duty_cycle": analysis.duty_cycle,
-                "burst_total_duration_s": analysis.burst_total_duration_s,
-                "capture_duration_s": analysis.capture_duration_s,
-                "refined_center_hz": hit.freq_hz,
-                "frequency_estimate_method": analysis.frequency_estimate_method,
-                "frequency_uncertainty_hz": analysis.frequency_uncertainty_hz,
-                "channel_plan": channel_match.plan if channel_match else None,
-                "channel_id": channel_match.channel_id if channel_match else None,
-                "channel_description": (
-                    channel_match.description if channel_match else None
-                ),
-            },
-        )
-        try:
-            det_id = await detection_repo.insert(record)
-            log.info(
-                "v0.5.42 survey detection: %.3f MHz / %d kHz / SF%s%s "
-                "(SNR %.1f dB)%s — id=%d",
-                hit.freq_hz / 1e6, hit.bandwidth_hz // 1000,
-                sf or "?",
-                f" {variant}" if variant else "",
-                hit.snr_db,
-                (
-                    f" — matched {channel_match.description}"
-                    if channel_match else ""
-                ),
-                det_id,
-            )
-        except Exception:
-            log.exception(
-                "failed to insert survey detection at %.3f MHz",
-                hit.freq_hz / 1e6,
-            )
-
-    async def _offer_confirmation_wave(self, detection_repo) -> None:
-        """Prompt the operator to run an additional confirmation-only
-        wave if the queue still has pending work after all main waves
-        complete. 120-second timeout with default N.
-
-        Estimates time cost so the operator can make an informed choice:
-        N clusters × 120 s worst case, but typically much less because
-        of early exit when transmitters burst promptly.
-        """
-        import click
-
-        pending_count = self._confirmation_queue.pending_count()
-        if pending_count == 0:
-            return
-
-        clusters = self._confirmation_queue.cluster_for_capture()
-        if not clusters:
-            return
-
-        # Worst-case time: one cluster per free dongle, serialized
-        # (which isn't actually what'd happen — they'd run in
-        # parallel, one per dongle), capped at max_duration_s.
-        worst_s = sum(c.max_duration_s for c in clusters)
-        usable_count = max(1, len(self.registry.usable()))
-        estimated_s = worst_s / usable_count
-        prompt = (
-            f"\n{pending_count} LoRa detection(s) still need IQ confirmation "
-            f"for SF classification.\n"
-            f"Estimated ≤ {estimated_s/60:.0f} min to confirm "
-            f"({len(clusters)} cluster(s), {usable_count} dongle(s) free, "
-            f"{worst_s/60:.0f} min total budget).\n"
-            f"Run an additional confirmation-only wave? [y/N] "
-            f"(120s timeout → N): "
-        )
-        click.echo(prompt, err=True, nl=False)
-
-        answer = await self._prompt_with_timeout(timeout_s=120.0)
-        if answer is None or answer.strip().lower() not in ("y", "yes"):
-            click.echo(
-                f"\nSkipping confirmation wave. {pending_count} "
-                f"LoRa detection(s) kept with estimated_sf=None. "
-                f"Run `rfcensus scan` again later to re-attempt.",
-                err=True,
-            )
-            return
-
-        click.echo(
-            f"\nRunning confirmation-only wave: {len(clusters)} cluster(s)...",
-            err=True,
-        )
-
-        # Execute each cluster against any available dongle.
-        # Parallel across dongles.
-        from rfcensus.engine.scheduler import Wave, ScheduleTask
-        from rfcensus.config.schema import BandConfig
-
-        tasks_list: list[ScheduleTask] = []
-        usable = list(self.registry.usable())
-        for cluster, dongle in zip(clusters, usable):
-            synthetic_band = BandConfig(
-                id=f"confirm_{cluster.center_freq_hz // 1000}khz",
-                name=f"LoRa confirmation @ {cluster.center_freq_hz/1e6:.3f} MHz",
-                freq_low=cluster.min_freq_hz,
-                freq_high=cluster.max_freq_hz,
-                strategy="decoder_only",
-                effective_power_scan_bin_hz=25_000,
-            )
-            tasks_list.append(
-                ScheduleTask(
-                    band=synthetic_band,
-                    suggested_dongle_id=dongle.id,
-                    suggested_antenna_id=(
-                        dongle.antenna.id if dongle.antenna else None
-                    ),
-                    dongles_needed=1,
-                    confirmation_cluster=cluster,
-                )
-            )
-            await self._confirmation_queue.mark_scheduled(cluster)
-
-        # Run in parallel
-        results = await asyncio.gather(
-            *(self._run_confirmation_task(t, detection_repo) for t in tasks_list),
-            return_exceptions=True,
-        )
-        for r in results:
-            if isinstance(r, Exception):
-                log.error("confirmation wave task raised: %s", r)
-                continue
-            self._strategy_results.append(r)
-
-        click.echo(
-            f"Confirmation wave complete: "
-            f"{self._confirmation_queue.completed_count()} confirmed, "
-            f"{self._confirmation_queue.abandoned_count()} timed out.",
-            err=True,
-        )
-
-    async def _prompt_with_timeout(self, *, timeout_s: float) -> str | None:
-        """Read a single line from stdin with a timeout. Returns None
-        on timeout (caller treats as default answer). Intended for
-        the Y/N confirmation-wave prompt.
-
-        Non-tty stdin (e.g. CI, piped input) returns None immediately
-        so automated runs don't hang for 120s waiting for a human.
-        """
-        import sys
-        if not sys.stdin.isatty():
-            return None
-
-        try:
-            loop = asyncio.get_event_loop()
-            answer = await asyncio.wait_for(
-                loop.run_in_executor(None, sys.stdin.readline),
-                timeout=timeout_s,
-            )
-            return answer
-        except (asyncio.TimeoutError, TimeoutError):
-            return None
-        except Exception:
-            return None
 
 
     def _log_hardware_summary(self) -> None:
@@ -881,6 +483,78 @@ class SessionRunner:
             "to your shell rc."
         )
 
+    # ────────────────────────────────────────────────────────────────
+    # v0.6.5: external control surface (TUI calls these)
+    # ────────────────────────────────────────────────────────────────
+
+    async def pause_session(self) -> None:
+        """Pause the active session. Idempotent.
+
+        Effect:
+          • Sets self.control.paused so the wave loop blocks before
+            the next wave.
+          • Pauses every active shared fanout's writes — decoders
+            block on socket reads. No process kills.
+
+        On long pauses, the deep_pause_watcher (started in run())
+        eventually triggers decoder teardown to release CPU.
+        """
+        await self.control.pause()
+        try:
+            self.broker.pause_all_fanouts()
+        except Exception:
+            log.exception("broker.pause_all_fanouts failed (non-fatal)")
+
+    async def resume_session(self) -> dict[str, bool]:
+        """Resume the paused session.
+
+        Returns a per-dongle dict {dongle_id: all_clients_alive} so the
+        caller can log per-fanout health post-pause. False entries mean
+        one or more decoder clients on that fanout died during pause
+        (their TCP socket broke when resume_writes probed it).
+
+        v0.6.5 behavior: dead clients are NOT auto-restarted within
+        the current wave. The decoder's strategy task will surface the
+        socket-closed error and end its run. The wave still completes;
+        subsequent waves re-allocate everything fresh. The
+        "always-restart-crashed-decoders" pattern is broader v0.6.6+
+        work that handles this and equivalent in-wave failures
+        (decoder process OOM, USB unplug, etc.) uniformly.
+        """
+        results = {}
+        try:
+            results = self.broker.resume_all_fanouts()
+        except Exception:
+            log.exception("broker.resume_all_fanouts failed (non-fatal)")
+        await self.control.resume()
+
+        # Surface dead-client warnings so the user sees what happened
+        # instead of silently losing decoders.
+        dead = [d for d, alive in results.items() if not alive]
+        if dead:
+            log.warning(
+                "after resume: %d fanout(s) had dead clients: %s. "
+                "Affected decoders will end with errors and be "
+                "re-allocated on subsequent waves.",
+                len(dead), ", ".join(dead),
+            )
+        return results
+
+    def request_stop(self) -> None:
+        """Mark the session for graceful shutdown.
+
+        Same effect as Ctrl-C: wave loop exits between waves, in-flight
+        tasks finish naturally, leases release. Used by the TUI's `q`
+        confirm path.
+        """
+        self._stop_requested = True
+        # Also wake any pause-waiters so they exit cleanly instead of
+        # blocking forever.
+        try:
+            asyncio.get_event_loop().create_task(self.control.stop())
+        except Exception:
+            pass
+
     async def run(self) -> SessionResult:
         started = datetime.now(timezone.utc)
 
@@ -925,9 +599,8 @@ class SessionRunner:
                 config_snap=self.config.model_dump(),
             )
         )
-        # v0.5.42: stash session_id on self so the in-window survey
-        # handler (called from confirmation_task callback) can build
-        # DetectionRecords with the right session FK.
+        # Stash session_id on self so any background task that needs
+        # to build a DetectionRecord can find the right FK.
         self._current_session_id = session_id
 
         for dongle in self.registry.usable():
@@ -958,15 +631,12 @@ class SessionRunner:
             anomaly_repo=anomaly_repo,
             detection_repo=detection_repo,
             capture_power=self.capture_power,
-            confirmation_queue=self._confirmation_queue,
         )
 
-        # Attach detectors — they subscribe to ActiveChannelEvent
-        # and emit DetectionEvent; the DetectionWriter persists them.
-        # Attach detectors — they subscribe to ActiveChannelEvent and emit
-        # DetectionEvent; the DetectionWriter persists them. Detectors that
-        # declare consumes_iq=True get an IQCaptureService for escalated
-        # confirmation.
+        # Attach detectors — they subscribe to ActiveChannelEvent and
+        # emit DetectionEvent; the DetectionWriter persists them.
+        # Detectors that declare consumes_iq=True get an
+        # IQCaptureService for opportunistic IQ inspection.
         from rfcensus.spectrum import IQCaptureService
 
         iq_service = IQCaptureService(self.broker)
@@ -1006,6 +676,39 @@ class SessionRunner:
             SessionEvent(session_id=session_id, kind="started", phase="init")
         )
 
+        # v0.6.0: start pinned-decoder supervisors BEFORE the scheduler
+        # plans, so the broker's exclusive-lease tracking removes pinned
+        # dongles from the candidate pool. The scheduler then naturally
+        # operates on the remaining (unpinned) dongles.
+        if self._pin_specs:
+            from rfcensus.engine.pinning import (
+                start_pinned_tasks, summarize_pinning_outcome,
+                warn_if_all_dongles_pinned,
+            )
+            try:
+                self._pinning_outcome = await start_pinned_tasks(
+                    self._pin_specs,
+                    registry=self.registry,
+                    broker=self.broker,
+                    decoder_registry=registry_handle,
+                    event_bus=self.event_bus,
+                    session_id=session_id,
+                    gain=self.gain,
+                    allow_antenna_mismatch=self._allow_pin_antenna_mismatch,
+                )
+            except NoDongleAvailable as exc:
+                # Fatal pin validation. Surface to the caller — they
+                # should abort the session cleanly. Re-raise.
+                log.error("pin validation failed: %s", exc)
+                raise
+            for line in summarize_pinning_outcome(self._pinning_outcome):
+                log.info(line)
+            all_pinned = warn_if_all_dongles_pinned(
+                self._pinning_outcome, self.registry,
+            )
+            if all_pinned:
+                log.warning(all_pinned)
+
         scheduler = Scheduler(
             self.config, self.broker,
             all_bands=self.all_bands,
@@ -1017,6 +720,31 @@ class SessionRunner:
             "plan: %d wave(s), %d task(s) total",
             len(plan.waves), len(plan.tasks),
         )
+        # v0.6.5: publish PlanReadyEvent so the TUI can render the
+        # wave plan up front. Wrapped in try/except so a broken
+        # subscriber doesn't break planning.
+        try:
+            from rfcensus.events import PlanReadyEvent
+            wave_payloads: list[dict] = []
+            for w in plan.waves:
+                summaries = []
+                for t in w.tasks:
+                    summaries.append(
+                        f"{t.band.id}→{t.suggested_dongle_id or '?'}"
+                    )
+                wave_payloads.append({
+                    "index": w.index,
+                    "task_count": len(w.tasks),
+                    "task_summaries": summaries,
+                })
+            await self.event_bus.publish(PlanReadyEvent(
+                session_id=session_id,
+                waves=wave_payloads,
+                total_tasks=len(plan.tasks),
+                max_parallel_per_wave=plan.max_parallel_per_wave,
+            ))
+        except Exception:
+            log.exception("PlanReadyEvent publish failed (non-fatal)")
         self._log_unassigned_warning(plan)
         self._log_decoder_binary_preflight()
 
@@ -1115,6 +843,46 @@ class SessionRunner:
             REPROBE_NORMAL_S = 60.0   # Healthy fleet: re-probe once per minute
             REPROBE_FAILED_S = 15.0   # Something's failed: faster recovery
 
+            # v0.6.5: deep-pause watcher. When the user keeps the
+            # session paused longer than DEEP_PAUSE_THRESHOLD_S (20s),
+            # tear down all shared fanouts to release CPU. On resume
+            # the wave loop's normal restart path re-allocates and
+            # re-launches everything fresh. Lightweight task — sleeps
+            # most of the time.
+            from rfcensus.engine.session_control import (
+                deep_pause_watcher,
+            )
+
+            async def _on_deep_pause():
+                # Deep-pause threshold crossed (>20s paused).
+                # Disconnect every active downstream fanout client so
+                # decoder processes exit cleanly on socket EOF. The
+                # upstream rtl_tcp + lease stay alive, so the dongle
+                # isn't returned to the broker pool — when the user
+                # resumes, the wave loop's natural restart path
+                # re-allocates and re-launches without contention.
+                try:
+                    n = self.broker.deep_pause_teardown_fanouts()
+                    if n > 0:
+                        log.info(
+                            "deep-pause: %d downstream client(s) "
+                            "disconnected; decoders will exit and the "
+                            "next wave will rebuild",
+                            n,
+                        )
+                except Exception:
+                    log.exception("deep-pause callback failed")
+
+            deep_pause_task = asyncio.create_task(
+                deep_pause_watcher(self.control, _on_deep_pause),
+                name="deep_pause_watcher",
+            )
+            # Don't add to _sidecar_tasks — that set's cleanup loop
+            # awaits everything to completion, and this task is an
+            # infinite loop. Track it on `self` so the teardown path
+            # can cancel it explicitly.
+            self._deep_pause_task = deep_pause_task
+
             while True:
                 pass_n += 1
                 if max_passes is not None and pass_n > max_passes:
@@ -1168,11 +936,26 @@ class SessionRunner:
                         log.info("stop requested; exiting wave loop")
                         break
 
-                    # v0.5.41: fill idle slots in this wave with
-                    # confirmation clusters. Queue may be empty on
-                    # wave 0, but waves 1+ pick up work submitted by
-                    # detections from earlier waves.
-                    self._augment_wave_with_confirmations(wave, detection_repo)
+                    # v0.6.5: honor pause between waves. If user hit
+                    # `p`, block here until they hit `p` again. The
+                    # paused wall-clock time is tracked in
+                    # self.control.total_paused_s and excluded from
+                    # the duration ceiling later. While paused the
+                    # currently-active fanouts have already been
+                    # quick-paused via control.on_pause() callback;
+                    # this gate is the wave-level coordination so we
+                    # don't launch new tasks during a pause.
+                    if self.control.is_paused():
+                        log.info(
+                            "wave loop paused — waiting for resume...",
+                        )
+                        await self.control.wait_not_paused()
+                        if self.control.stopped.is_set():
+                            log.info(
+                                "stop requested during pause; exiting wave loop",
+                            )
+                            break
+                        log.info("wave loop resumed")
 
                     log.info("executing wave %d (%d task(s))", wave.index, len(wave.tasks))
                     await self.event_bus.publish(
@@ -1183,69 +966,152 @@ class SessionRunner:
                             detail=f"{len(wave.tasks)} tasks",
                         )
                     )
+                    # v0.6.5: WaveStartedEvent for the TUI plan-tree.
+                    try:
+                        from rfcensus.events import WaveStartedEvent
+                        await self.event_bus.publish(WaveStartedEvent(
+                            session_id=session_id,
+                            wave_index=wave.index,
+                            task_count=len(wave.tasks),
+                            pass_n=pass_n,
+                        ))
+                    except Exception:
+                        log.exception(
+                            "WaveStartedEvent publish failed (non-fatal)",
+                        )
 
                     async def _run_task(task):
                         async with sem:
-                            if task.suggested_dongle_id is None:
-                                log.warning(
-                                    "skipping %s: no usable dongle", task.band.id
+                            consumer_label = f"strategy:{task.band.id}"
+                            # v0.6.5: TaskStartedEvent fires unconditionally
+                            # so the dashboard sees the task even if it
+                            # gets skipped/crashed downstream.
+                            try:
+                                from rfcensus.events import TaskStartedEvent
+                                await self.event_bus.publish(TaskStartedEvent(
+                                    session_id=session_id,
+                                    wave_index=wave.index,
+                                    pass_n=pass_n,
+                                    band_id=task.band.id,
+                                    dongle_id=task.suggested_dongle_id or "",
+                                    consumer=consumer_label,
+                                ))
+                            except Exception:
+                                log.exception(
+                                    "TaskStartedEvent publish failed",
                                 )
-                                return StrategyResult(
-                                    band_id=task.band.id, errors=["unassigned"]
-                                )
-                            # v0.5.41: confirmation tasks route to a
-                            # different executor (IQ capture + DDC +
-                            # chirp analysis), not the normal strategy
-                            # pipeline. The band is synthesized just
-                            # for antenna matching.
-                            if task.confirmation_cluster is not None:
-                                return await self._run_confirmation_task(
-                                    task, detection_repo
-                                )
-                            # Interactive hook for guided modes — runs
-                            # before strategy starts, can skip the band
-                            if self.before_task_hook is not None:
-                                action = await self.before_task_hook(task)
-                                if action == "skip":
-                                    log.info(
-                                        "user skipped %s via before_task_hook",
-                                        task.band.id,
+
+                            task_status = "ok"
+                            task_detail = ""
+                            task_result = None
+                            try:
+                                if task.suggested_dongle_id is None:
+                                    log.warning(
+                                        "skipping %s: no usable dongle", task.band.id
                                     )
-                                    return StrategyResult(
+                                    task_status = "skipped"
+                                    task_detail = "no usable dongle"
+                                    task_result = StrategyResult(
+                                        band_id=task.band.id, errors=["unassigned"]
+                                    )
+                                    return task_result
+                                # Interactive hook for guided modes — runs
+                                # before strategy starts, can skip the band
+                                if self.before_task_hook is not None:
+                                    action = await self.before_task_hook(task)
+                                    if action == "skip":
+                                        log.info(
+                                            "user skipped %s via before_task_hook",
+                                            task.band.id,
+                                        )
+                                        task_status = "skipped"
+                                        task_detail = "user skipped"
+                                        task_result = StrategyResult(
+                                            band_id=task.band.id,
+                                            errors=["user_skipped"],
+                                        )
+                                        return task_result
+                                strategy = self._dispatcher.strategy_for(task.band)
+                                log.info(
+                                    "starting %s on %s (dongle %s)%s",
+                                    strategy.__class__.__name__,
+                                    task.band.id,
+                                    task.suggested_dongle_id,
+                                    (
+                                        f" [decoders: {sorted(task.allowed_decoders)}]"
+                                        if task.allowed_decoders is not None
+                                        else ""
+                                    ),
+                                )
+                                task_result = await strategy.execute(
+                                    task.band,
+                                    self._ctx,
+                                    allowed_decoders=task.allowed_decoders,
+                                )
+                                # Reset consecutive-failure counter on success:
+                                # a successful run wipes prior bad-luck history
+                                if task_result.ended_reason != "hardware_lost":
+                                    self._record_success(task.suggested_dongle_id)
+                                if task_result.errors:
+                                    task_status = "failed"
+                                    task_detail = task_result.errors[0]
+                                return task_result
+                            except Exception as exc:
+                                task_status = "crashed"
+                                task_detail = str(exc)
+                                raise
+                            finally:
+                                # v0.6.5: always publish TaskCompletedEvent,
+                                # whether the task succeeded, was skipped, or
+                                # raised. This is the dashboard's signal that
+                                # a task is no longer in flight.
+                                try:
+                                    from rfcensus.events import TaskCompletedEvent
+                                    await self.event_bus.publish(TaskCompletedEvent(
+                                        session_id=session_id,
+                                        wave_index=wave.index,
+                                        pass_n=pass_n,
                                         band_id=task.band.id,
-                                        errors=["user_skipped"],
+                                        dongle_id=task.suggested_dongle_id or "",
+                                        consumer=consumer_label,
+                                        status=task_status,
+                                        detail=task_detail,
+                                    ))
+                                except Exception:
+                                    log.exception(
+                                        "TaskCompletedEvent publish failed",
                                     )
-                            strategy = self._dispatcher.strategy_for(task.band)
-                            log.info(
-                                "starting %s on %s (dongle %s)%s",
-                                strategy.__class__.__name__,
-                                task.band.id,
-                                task.suggested_dongle_id,
-                                (
-                                    f" [decoders: {sorted(task.allowed_decoders)}]"
-                                    if task.allowed_decoders is not None
-                                    else ""
-                                ),
-                            )
-                            result = await strategy.execute(
-                                task.band,
-                                self._ctx,
-                                allowed_decoders=task.allowed_decoders,
-                            )
-                            # Reset consecutive-failure counter on success:
-                            # a successful run wipes prior bad-luck history
-                            if result.ended_reason != "hardware_lost":
-                                self._record_success(task.suggested_dongle_id)
-                            return result
 
                     raw = await asyncio.gather(
                         *(_run_task(t) for t in wave.tasks), return_exceptions=True
                     )
+                    successful_count = 0
+                    wave_errors: list[str] = []
                     for r in raw:
                         if isinstance(r, Exception):
                             log.error("strategy raised: %s", r)
+                            wave_errors.append(str(r))
                             continue
                         self._strategy_results.append(r)
+                        if r is not None and not r.errors:
+                            successful_count += 1
+                        elif r is not None and r.errors:
+                            wave_errors.extend(r.errors)
+                    # v0.6.5: WaveCompletedEvent.
+                    try:
+                        from rfcensus.events import WaveCompletedEvent
+                        await self.event_bus.publish(WaveCompletedEvent(
+                            session_id=session_id,
+                            wave_index=wave.index,
+                            pass_n=pass_n,
+                            task_count=len(wave.tasks),
+                            successful_count=successful_count,
+                            errors=wave_errors,
+                        ))
+                    except Exception:
+                        log.exception(
+                            "WaveCompletedEvent publish failed (non-fatal)",
+                        )
 
                 # End-of-pass: check --until-quiet. Only after at least
                 # one full pass — we need the EmitterTracker to have had
@@ -1258,21 +1124,25 @@ class SessionRunner:
                     )
                     break
 
-            # v0.5.41: after all main waves complete, offer to run an
-            # additional confirmation-only wave if the queue still has
-            # pending tasks that didn't fit into any main wave's idle
-            # slots. The whole dongle pool is free at this point.
-            if (
-                not self._stop_requested
-                and self._confirmation_queue.has_work()
-            ):
-                await self._offer_confirmation_wave(detection_repo)
         finally:
             if sigint_installed:
                 try:
                     loop.remove_signal_handler(signal.SIGINT)
                 except (NotImplementedError, RuntimeError):
                     pass
+
+        # v0.6.5: cancel the deep-pause watcher first. It's an
+        # infinite loop, so the _sidecar_tasks gather below would
+        # block forever waiting for it.
+        if self._deep_pause_task is not None:
+            self._deep_pause_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    self._deep_pause_task, timeout=2.0,
+                )
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+            self._deep_pause_task = None
 
         # Wait briefly for any in-flight sidecar retries to complete
         if self._sidecar_tasks:
@@ -1312,6 +1182,21 @@ class SessionRunner:
             await asyncio.wait_for(self.event_bus.drain(timeout=15.0), timeout=20.0)
         except (asyncio.TimeoutError, TimeoutError):
             log.warning("event_bus.drain() timed out after 20s; continuing")
+
+        # v0.6.0: stop pinned supervisors BEFORE broker.shutdown so the
+        # broker can cleanly release the leases (and tear down any
+        # rtl_tcp slots they were holding).
+        if self._pinning_outcome is not None:
+            from rfcensus.engine.pinning import stop_pinned_tasks
+            try:
+                await asyncio.wait_for(
+                    stop_pinned_tasks(self._pinning_outcome, self.broker),
+                    timeout=15.0,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                log.warning(
+                    "stop_pinned_tasks() timed out after 15s; continuing"
+                )
 
         try:
             await asyncio.wait_for(self.broker.shutdown(), timeout=15.0)

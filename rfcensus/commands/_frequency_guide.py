@@ -122,7 +122,7 @@ COMMON_FREQUENCIES: tuple[FrequencyProfile, ...] = (
             "EU TPMS, EU LoRa, garage remotes. Very busy band."
         ),
         decoders=("rtl_433",),
-        detectors=("lora",),
+        detectors=(),  # v0.6.6: lora detector removed; LoraSurveyTask runs as a sidecar on lora_survey-enabled bands
         suggested_antenna_id="whip_433",
     ),
     FrequencyProfile(
@@ -162,7 +162,7 @@ COMMON_FREQUENCIES: tuple[FrequencyProfile, ...] = (
             "EU equivalent of the US 915 MHz band."
         ),
         decoders=("rtl_433",),
-        detectors=("lora",),
+        detectors=(),  # v0.6.6: lora detector removed; LoraSurveyTask runs as a sidecar on lora_survey-enabled bands
         suggested_antenna_id="whip_915",
         notes="If you're in the US, you probably want 915 MHz instead.",
     ),
@@ -176,7 +176,7 @@ COMMON_FREQUENCIES: tuple[FrequencyProfile, ...] = (
             "amateur experimentation."
         ),
         decoders=("rtl_433", "rtlamr"),
-        detectors=("lora",),
+        detectors=(),  # v0.6.6: lora detector removed; LoraSurveyTask runs as a sidecar on lora_survey-enabled bands
         suggested_antenna_id="whip_915",
     ),
     FrequencyProfile(

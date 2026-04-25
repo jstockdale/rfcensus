@@ -40,7 +40,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from rfcensus.spectrum.chirp_analysis import ChirpAnalysis, analyze_chirps
+from rfcensus.spectrum.chirp_analysis import (
+    ChirpAnalysis,
+    analyze_chirps,
+    classify_sf_dechirp,
+    label_variant,
+)
 from rfcensus.tools.dsp import digital_downconvert
 from rfcensus.utils.logging import get_logger
 
@@ -152,8 +157,14 @@ def survey_iq_window(
         clear_hi = min(remaining_power.size, high_idx + guard_samples + 1)
         remaining_power[clear_lo:clear_hi] = 0.0
 
-    # Step 4: for each candidate, DDC + chirp analysis at the best-
-    # matching template width
+    # Step 4: for each candidate, DDC + reference-dechirp SF
+    # classification at each plausible template width. Pick the
+    # template/SF pair with the highest dechirp peak concentration —
+    # that's the BW × SF combination that actually fits the signal.
+    # v0.6.8: this replaces the v0.6.5 path which used analyze_chirps
+    # (slope-fit method) for both gating and BW selection. The slope
+    # method assumes single-chirp-with-gaps segments; real LoRa packets
+    # are contiguous chirps so it produced semi-random results.
     hits: list[SurveyHit] = []
     for low_offset, high_offset, peak_lin in candidates:
         center_offset = (low_offset + high_offset) / 2.0
@@ -168,19 +179,26 @@ def survey_iq_window(
         if excluded:
             continue
 
-        # Try templates from widest to narrowest; score each by how
-        # well the observed chirp's frequency range matches the
-        # template width. First-match-wins biases toward wider
-        # templates since any chirp analysis on sufficient samples
-        # produces linear segments; we need to pick the template
-        # whose BW actually matches the signal.
         candidate_span = high_offset - low_offset
+
+        # Dechirp each plausible template width and keep the one with
+        # the highest peak concentration. Concentration is comparable
+        # ACROSS templates because it's a fraction of total energy in
+        # the dechirped spectrum's peak bin — a 250 kHz LoRa packet
+        # viewed through the matching 250 kHz template gives much
+        # higher concentration than the same packet viewed through a
+        # 125 kHz template (which only sees half the chirp's frequency
+        # excursion).
         best_hit: SurveyHit | None = None
-        best_score: float = -1.0
+        best_concentration: float = 0.0
         for template_hz in SURVEY_TEMPLATES_HZ:
-            if candidate_span > template_hz * 1.5:
+            # Loose pre-filter: candidate span vs template width. The
+            # span comes from a noisy power-spectrum peak edge so we
+            # allow a wide window. The dechirp scoring is the real
+            # discriminator.
+            if candidate_span > template_hz * 1.8:
                 continue
-            if candidate_span < template_hz * 0.4:
+            if candidate_span < template_hz * 0.3:
                 continue
 
             try:
@@ -202,54 +220,80 @@ def survey_iq_window(
             decimated_rate = int(
                 round(baseband.size / (samples.size / sample_rate))
             )
+
+            # Run dechirp classifier — the new SF discriminator
+            try:
+                est_sf, sf_conf, sf_peak, sf_scores = classify_sf_dechirp(
+                    baseband, decimated_rate, template_hz,
+                )
+            except Exception:
+                log.exception("survey: dechirp classifier failed")
+                continue
+
+            if est_sf is None:
+                # Either no SF passed gates OR no chunks were scoreable.
+                # We still want analyze_chirps for SNR/duty-cycle even
+                # if no SF was confidently picked, but only if THIS
+                # template's peak score is the running best.
+                continue
+
+            if sf_peak <= best_concentration:
+                continue
+
+            # This is a stronger candidate than anything we've seen.
+            # Run analyze_chirps as a back-channel for SNR / duty
+            # cycle / capture metadata that goes into the SurveyHit.
             try:
                 analysis = analyze_chirps(baseband, decimated_rate)
             except Exception:
-                log.exception("survey: chirp analysis failed")
-                continue
+                log.exception("survey: chirp analysis (back-channel) failed")
+                analysis = ChirpAnalysis(
+                    chirp_confidence=0.0,
+                    num_chirp_segments=0,
+                    mean_segment_length_samples=0.0,
+                    mean_slope_hz_per_sec=0.0,
+                )
 
-            if not (
-                analysis.chirp_confidence > 0.5
-                and analysis.num_chirp_segments >= 1
-            ):
-                continue
+            # Stamp the dechirp-derived SF results onto ChirpAnalysis
+            # so downstream consumers (LoraSurveyTask._emit_detection,
+            # report renderer) get them via a single object.
+            analysis.estimated_sf = est_sf
+            analysis.sf_confidence = sf_conf
+            analysis.sf_peak_concentration = sf_peak
+            analysis.sf_scores = dict(sf_scores)
 
-            # Score this template: how close is its width to the
-            # observed chirp BW? Derive observed BW from slope ×
-            # segment duration (segment length / decimated rate).
-            observed_bw = abs(analysis.mean_slope_hz_per_sec) * (
-                analysis.mean_segment_length_samples / decimated_rate
+            snr_db = 10.0 * np.log10(
+                peak_lin / max(noise_floor_lin, 1e-20)
             )
-            # Relative error: template should be within ±30% of
-            # observed BW. Smaller relative error = better score.
-            rel_err = abs(template_hz - observed_bw) / template_hz
-            score = analysis.chirp_confidence - rel_err
-            if score > best_score:
-                snr_db = 10.0 * np.log10(
-                    peak_lin / max(noise_floor_lin, 1e-20)
+            hit_freq = absolute_center
+            if analysis.refined_center_offset_hz is not None:
+                hit_freq = absolute_center + int(
+                    analysis.refined_center_offset_hz
                 )
-                hit_freq = absolute_center
-                if analysis.refined_center_offset_hz is not None:
-                    hit_freq = absolute_center + int(
-                        analysis.refined_center_offset_hz
-                    )
-                best_hit = SurveyHit(
-                    freq_hz=hit_freq,
-                    bandwidth_hz=template_hz,
-                    chirp_analysis=analysis,
-                    snr_db=snr_db,
-                )
-                best_score = score
+            best_hit = SurveyHit(
+                freq_hz=hit_freq,
+                bandwidth_hz=template_hz,
+                chirp_analysis=analysis,
+                snr_db=snr_db,
+            )
+            best_concentration = sf_peak
 
         if best_hit is not None:
             hits.append(best_hit)
+            variant = label_variant(
+                sf=best_hit.chirp_analysis.estimated_sf or 0,
+                bandwidth_hz=best_hit.bandwidth_hz,
+            )
             log.info(
-                "in-window survey hit: %.3f MHz / %d kHz "
-                "(SNR %.1f dB, %d chirp segments)",
+                "in-window survey hit: %.3f MHz / %d kHz / "
+                "SF%s%s (SNR %.1f dB, dechirp peak %.3f, conf %.2f)",
                 best_hit.freq_hz / 1e6,
                 best_hit.bandwidth_hz // 1000,
+                best_hit.chirp_analysis.estimated_sf,
+                f" {variant}" if variant else "",
                 best_hit.snr_db,
-                best_hit.chirp_analysis.num_chirp_segments,
+                best_hit.chirp_analysis.sf_peak_concentration,
+                best_hit.chirp_analysis.sf_confidence,
             )
     return hits
 

@@ -73,6 +73,87 @@ class AntennaConfig(BaseModel):
         return 0.2
 
 
+class PinConfig(BaseModel):
+    """Pin a decoder to a dongle for the entire session lifetime.
+
+    A pinned (dongle, decoder, freq) tuple takes a dedicated lease at
+    session bootstrap and runs the decoder in a long-running supervised
+    loop until the session ends. The pinned dongle is removed from the
+    scheduler's pool — other tasks cannot claim it.
+
+    Use this when you want guaranteed, gap-free coverage of a specific
+    target. Example: with five RTL-SDRs, pin one to rtl_433 @ 345 MHz
+    (Honeywell 5800), one to rtl_433 @ 433.92 MHz (weather + ISM), and
+    let the remaining three run the normal exploration scan.
+
+    Pins are declared per-dongle:
+
+        [[dongles]]
+        id = "00000043"
+        antenna = "whip_433_quarter"
+
+        [dongles.pin]
+        decoder = "rtl_433"
+        freq_hz = 433_920_000
+        sample_rate = 2_400_000      # optional; defaults to decoder's
+                                     # capabilities.preferred_sample_rate
+        access_mode = "exclusive"    # "exclusive" (default) or "shared"
+
+    Each dongle can hold at most one pin (a dongle can only tune one
+    frequency at a time). Absent `pin` section = current behavior, the
+    dongle is fully available to the scheduler.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    decoder: str
+    freq_hz: int
+    # When None, the supervisor uses the decoder's preferred sample rate
+    # at runtime (decoder.capabilities.preferred_sample_rate). Per-decoder
+    # defaults vary — rtl_433 wants 250 kHz or 1 MHz, rtlamr wants
+    # 2.4 MHz, etc. Most users should leave this unset.
+    sample_rate: int | None = None
+    # "exclusive" matches how strategy-launched decoders run: dongle is
+    # taken whole, no other consumer gets it. "shared" starts an
+    # rtl_tcp + fanout so additional decoders could in principle attach
+    # at the same center frequency, though pinning + sharing rarely
+    # combine usefully — listed for completeness.
+    access_mode: Literal["exclusive", "shared"] = "exclusive"
+
+    @field_validator("freq_hz")
+    @classmethod
+    def _freq_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError(f"pin freq_hz must be positive; got {v}")
+        # Sanity floor: anything below 1 MHz is almost certainly a typo
+        # (forgot the units multiplier in TOML — `freq_hz = 433_920` not
+        # `freq_hz = 433_920_000`). RTL-SDR's lower bound is 24 MHz with
+        # the upconverter or ~500 kHz direct-sample, so flag anything
+        # well below that as a likely mistake.
+        if v < 1_000_000:
+            raise ValueError(
+                f"pin freq_hz={v} is below 1 MHz; "
+                f"did you mean {v * 1000} (with kHz multiplier)?"
+            )
+        return v
+
+    @field_validator("sample_rate")
+    @classmethod
+    def _sample_rate_sane(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        # RTL-SDR practical sample rates are 225-300 kHz, 900-2400 kHz,
+        # and 2.56-2.88 MHz. Outside that range, the device produces
+        # garbage. Don't enforce strictly (HackRF and others differ),
+        # just sanity-check.
+        if v < 100_000 or v > 20_000_000:
+            raise ValueError(
+                f"pin sample_rate={v} outside reasonable range "
+                f"[100 kHz, 20 MHz]"
+            )
+        return v
+
+
 class DongleConfig(BaseModel):
     """Describes one SDR dongle the user has declared."""
 
@@ -86,6 +167,11 @@ class DongleConfig(BaseModel):
     bias_tee: bool = False
     tcxo_ppm: float = 1.0
     notes: str = ""
+    # v0.6.0: optional dedicated decoder pin. When set, this dongle is
+    # reserved at session start to run the named decoder at the named
+    # frequency for the entire session. The scheduler does not see it.
+    # See PinConfig docstring for details.
+    pin: PinConfig | None = None
 
 
 # ------------------------------------------------------------
@@ -145,6 +231,16 @@ class BandConfig(BaseModel):
     decoder_options: dict[str, dict[str, Any]] = Field(
         default_factory=dict
     )
+    # v0.6.5: enable a sidecar LoRa survey task that taps the band's
+    # shared fanout, periodically reads ~250ms of IQ, and runs the
+    # `survey_iq_window` chirp-pattern detector to find LoRa, LoRaWAN
+    # and Meshtastic signals. This bypasses the rtl_power-based
+    # WideChannelAggregator entirely — rtl_power's sweeping tuner
+    # can't capture multi-bin simultaneity that LoRa chirps require,
+    # so the IQ-survey approach is the only one that actually works
+    # on real-world LoRa traffic. Only meaningful on bands that
+    # already use a SHARED fanout (e.g. 915_ism with rtl_433+rtlamr).
+    lora_survey: bool = False
 
     @model_validator(mode="after")
     def _freq_ordered(self) -> BandConfig:

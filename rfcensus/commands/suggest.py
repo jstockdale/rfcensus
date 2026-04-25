@@ -114,6 +114,15 @@ async def _run_antennas(
         dongles=rt.registry.dongles,
         enabled_bands=enabled,
         available_antennas=catalog,
+        # v0.6.0: respect existing pins as constraints. Without this,
+        # `suggest antennas` could recommend swapping the antenna on a
+        # pinned dongle to one that's better for some unrelated band,
+        # silently breaking the pin's frequency coverage.
+        pinned_freqs={
+            d.id: d.pin.freq_hz
+            for d in rt.config.dongles
+            if d.pin is not None
+        },
     )
 
     # Build the human-readable plan output

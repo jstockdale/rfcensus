@@ -8,7 +8,8 @@ and warnings.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
 
 from rfcensus.engine.session import SessionResult
@@ -28,6 +29,50 @@ from rfcensus.storage.models import (
 # per band — showing them all makes the section longer than the actual
 # emitter data, which buries the lede.
 _MAX_UNTRACKED_CHANNELS_PER_BAND = 10
+
+# v0.6.2 — display tunables for the Mystery carriers section. Earlier
+# iterations of this section were prone to two failure modes that
+# combined to make the output unreadable in busy RF environments:
+#
+#   1. Bin spillover. A single carrier whose energy spans 3-5 adjacent
+#      FFT bins produced 3-5 near-duplicate ActiveChannelRecord rows.
+#      The "top 10 by persistence" list then showed the SAME carrier
+#      under three slightly different frequencies. Fix: cluster
+#      adjacent records within _ADJACENT_CLUSTER_WINDOW_HZ.
+#
+#   2. Saturated bands. Bands like business_uhf, frs_gmrs, and the P25
+#      voice channels carry hundreds of legitimate (just-undecoded)
+#      transmissions per scan. Listing the "top 10 mystery carriers"
+#      from a band with 900 active channels surfaces nothing useful —
+#      they're all 100% persistence at similar SNR, and they're not
+#      mysterious anyway, just unsupported. Fix: when post-clustering
+#      count exceeds _SATURATED_BAND_THRESHOLD, replace per-row
+#      enumeration with a one-paragraph "this band is saturated"
+#      summary that reports the band's overall character.
+
+# Cluster window: ActiveChannelRecords whose centers fall within this
+# distance of each other are treated as the same physical carrier
+# scattered across adjacent FFT bins. Picked at 25 kHz because:
+#   • Most narrowband ISM/OOK channels are 10-15 kHz wide; 25 kHz
+#     comfortably covers center-of-bin drift across 2-3 adjacent bins
+#     of a typical 5-10 kHz rtl_power sweep.
+#   • Two genuinely-distinct OOK key fobs in the wild rarely sit
+#     within 25 kHz of each other (frequency-agile transmitters spread
+#     across the band).
+#   • If we DO accidentally merge two real signals into one cluster
+#     entry, the cluster's 'count' field is honest signal that
+#     something interesting is there for the user to investigate.
+_ADJACENT_CLUSTER_WINDOW_HZ = 25_000
+
+# Above this many post-clustering carriers per band, we stop
+# enumerating individual rows and switch to summary mode. Pulled from
+# the empirical observation that bands with > ~50 active carriers are
+# almost always carrying normal radio service activity (business radio,
+# trunked voice, etc.) rather than genuinely mysterious signals.
+_SATURATED_BAND_THRESHOLD = 50
+
+# In summary mode, how many strongest-by-peak carriers to mention.
+_MAX_STRONGEST_IN_SUMMARY = 5
 
 # Tolerance when matching an active channel against a known emitter
 # frequency. The channel's bandwidth already gives us one envelope but
@@ -179,13 +224,12 @@ def render_text_report(
             "power scans but produced no decoder output and no detector"
         )
         lines.append(
-            "  classification. Persistent carriers here are the most "
-            "interesting — they suggest a signal that's present but"
+            "  classification. Adjacent FFT bins from the same carrier "
+            "are clustered; bands with too many active carriers to be"
         )
         lines.append(
-            "  that our current decoder/detector set doesn't recognize. "
-            f"(Showing top {_MAX_UNTRACKED_CHANNELS_PER_BAND} per band "
-            f"by persistence.)"
+            "  meaningfully \"mysterious\" (typically business radio, "
+            "trunked voice) are summarized rather than enumerated."
         )
 
         # Group by band. An active channel belongs to whichever band
@@ -205,25 +249,14 @@ def render_text_report(
 
         for band_id in sorted(by_band.keys()):
             channels = by_band[band_id]
-            # Sort by persistence_ratio desc (most interesting first),
-            # falling back to peak power when persistence is None
-            channels.sort(
-                key=lambda c: (
-                    c.persistence_ratio if c.persistence_ratio is not None else -1,
-                    c.peak_power_dbm if c.peak_power_dbm is not None else -999,
-                ),
-                reverse=True,
-            )
             lines.append("")
-            lines.append(f"  {band_id}  ({len(channels)} active)")
-            shown = channels[:_MAX_UNTRACKED_CHANNELS_PER_BAND]
-            for ch in shown:
-                lines.append("    " + _format_active_channel(ch))
-            if len(channels) > len(shown):
-                omitted = len(channels) - len(shown)
-                lines.append(
-                    f"    … {omitted} more in {band_id} not shown"
-                )
+            band = bands_by_id.get(band_id)
+            band_name = band.name if band is not None else None
+            lines.extend(_render_band_mystery_section(
+                band_id=band_id,
+                band_name=band_name,
+                channels=channels,
+            ))
 
     # Strategy summary
     lines.append("")
@@ -334,3 +367,335 @@ def _format_active_channel(ch: ActiveChannelRecord) -> str:
         f"persist={persist}  seen={_humanize_duration(duration_s)}  "
         f"[{classification}]"
     )
+
+
+# ────────────────────────────────────────────────────────────────────
+# v0.6.2 — clustering, scoring, and saturated-band display
+# ────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class _ChannelCluster:
+    """Group of ActiveChannelRecords merged because they're within
+    `_ADJACENT_CLUSTER_WINDOW_HZ` of each other.
+
+    Represents what's almost certainly one physical carrier whose
+    energy spilled across multiple adjacent FFT bins. The cluster's
+    aggregate stats (max peak, min floor, max persistence) describe
+    the underlying signal more accurately than any single bin row.
+    """
+
+    members: list[ActiveChannelRecord] = field(default_factory=list)
+
+    @property
+    def freq_low_hz(self) -> int:
+        return min(m.freq_center_hz - m.bandwidth_hz // 2 for m in self.members)
+
+    @property
+    def freq_high_hz(self) -> int:
+        return max(m.freq_center_hz + m.bandwidth_hz // 2 for m in self.members)
+
+    @property
+    def representative_freq_hz(self) -> int:
+        """Use the highest-peak member's frequency as the representative.
+        Most likely the actual transmitter center; the spillover bins
+        sit in the skirt."""
+        # `key=` so we don't fall through to comparing ActiveChannelRecords
+        # when peaks tie (records aren't orderable).
+        winner = max(
+            self.members,
+            key=lambda m: m.peak_power_dbm if m.peak_power_dbm is not None else -999,
+        )
+        return winner.freq_center_hz
+
+    @property
+    def peak_power_dbm(self) -> float | None:
+        peaks = [m.peak_power_dbm for m in self.members if m.peak_power_dbm is not None]
+        return max(peaks) if peaks else None
+
+    @property
+    def noise_floor_dbm(self) -> float | None:
+        # Min floor = quietest neighbour, best estimate of the true floor
+        # under this carrier (some bins have higher floors due to the
+        # carrier itself raising the local noise estimate).
+        floors = [m.noise_floor_dbm for m in self.members if m.noise_floor_dbm is not None]
+        return min(floors) if floors else None
+
+    @property
+    def persistence_ratio(self) -> float | None:
+        ratios = [m.persistence_ratio for m in self.members if m.persistence_ratio is not None]
+        return max(ratios) if ratios else None
+
+    @property
+    def sample_count(self) -> int | None:
+        """Max sample_count across members — the best evidence any
+        merged bin has. Returns None if no member tracks sample_count
+        (e.g. rows from a pre-v0.6.3 database, or synthetic records
+        in tests that didn't set the field)."""
+        counts = [m.sample_count for m in self.members if m.sample_count is not None]
+        return max(counts) if counts else None
+
+    @property
+    def first_seen(self) -> datetime:
+        return min(m.first_seen for m in self.members)
+
+    @property
+    def last_seen(self) -> datetime:
+        return max(m.last_seen for m in self.members)
+
+    @property
+    def classification(self) -> str | None:
+        """Most common non-None classification across members."""
+        cls = [m.classification for m in self.members if m.classification]
+        if not cls:
+            return None
+        counts = Counter(cls)
+        return counts.most_common(1)[0][0]
+
+    @property
+    def count(self) -> int:
+        """How many raw bins were merged. count > 1 = bin spillover."""
+        return len(self.members)
+
+
+def _cluster_adjacent_channels(
+    channels: list[ActiveChannelRecord],
+    *,
+    window_hz: int = _ADJACENT_CLUSTER_WINDOW_HZ,
+) -> list[_ChannelCluster]:
+    """Merge ActiveChannelRecords whose centers fall within `window_hz`
+    of each other into shared clusters.
+
+    O(n log n): sort by frequency, then walk linearly, growing the
+    current cluster while the next channel's center is within
+    `window_hz` of the previous channel's center.
+
+    Note that this clusters by CENTER-to-CENTER distance only; we
+    don't try to be clever about asymmetric spillover. A 25 kHz
+    window comfortably covers the typical 2-3 adjacent rtl_power bins
+    that one narrowband carrier produces.
+    """
+    if not channels:
+        return []
+
+    sorted_chs = sorted(channels, key=lambda c: c.freq_center_hz)
+    clusters: list[_ChannelCluster] = []
+    current = _ChannelCluster(members=[sorted_chs[0]])
+    for ch in sorted_chs[1:]:
+        prev = current.members[-1]
+        if ch.freq_center_hz - prev.freq_center_hz <= window_hz:
+            current.members.append(ch)
+        else:
+            clusters.append(current)
+            current = _ChannelCluster(members=[ch])
+    clusters.append(current)
+    return clusters
+
+
+# v0.6.3 — sample-count threshold below which persistence ratios
+# are considered unreliable. The mystery_score multiplies in a
+# low-confidence factor when the cluster's best member has fewer
+# than this many observations, so a bin that popped once and got
+# a coincidental 100% persistence doesn't outrank a sustained
+# carrier that was observed for thousands of sweeps.
+_MYSTERY_MIN_CONFIDENT_N = 30
+
+
+def _mystery_score(cluster: _ChannelCluster) -> float:
+    """Composite "interestingness" score for ranking mystery carriers.
+
+    persistence × min(snr, 30) / 30 × confidence_from_n
+
+    Persistence-only ranking ties at 100% across most strong carriers
+    in busy bands and is therefore useless. Combining persistence with
+    SNR (capped at 30 dB so a +50 dBm intermod product doesn't dominate
+    a +20 dBm legitimate carrier) gives a usable ordering: consistent
+    AND clearly above the floor scores high; a brief weak burst or a
+    long-running carrier just above the floor scores low.
+
+    The sample-count factor (v0.6.3) further protects against
+    coincidental high-persistence scores on bins that were only
+    observed a handful of times — sample_count below _MYSTERY_MIN_CONFIDENT_N
+    scales the score toward zero so well-observed real carriers
+    outrank briefly-seen anomalies.
+    """
+    p = cluster.persistence_ratio or 0.0
+    peak = cluster.peak_power_dbm
+    floor = cluster.noise_floor_dbm
+    if peak is None or floor is None:
+        snr_factor = 0.5  # treat unknown SNR as middling
+    else:
+        snr = peak - floor
+        snr_factor = max(0.0, min(snr, 30.0)) / 30.0
+
+    # Confidence factor based on observation count. If sample_count is
+    # unavailable (None from pre-v0.6.3 data or from tests), assume
+    # middling confidence so scores don't collapse across the board.
+    n = cluster.sample_count
+    if n is None:
+        n_factor = 1.0  # unknown → don't penalize (backward-compatible)
+    else:
+        n_factor = min(1.0, n / _MYSTERY_MIN_CONFIDENT_N)
+
+    return p * snr_factor * n_factor
+
+
+def _format_cluster(cluster: _ChannelCluster) -> str:
+    """One-line representation of a clustered carrier for the report.
+
+    Single-bin clusters look like the v0.5.36 single-channel output
+    (so simple cases stay readable). Multi-bin clusters add a span
+    annotation and the bin count.
+    """
+    rep = cluster.representative_freq_hz / 1_000_000
+    peak = (
+        f"{cluster.peak_power_dbm:+.1f} dBm"
+        if cluster.peak_power_dbm is not None else "? dBm"
+    )
+    floor = (
+        f"{cluster.noise_floor_dbm:+.1f} dBm"
+        if cluster.noise_floor_dbm is not None else "? dBm"
+    )
+    persist = (
+        f"{cluster.persistence_ratio * 100:.0f}%"
+        if cluster.persistence_ratio is not None else "?"
+    )
+    # v0.6.3: show sample count when available so users can distinguish
+    # "100% persistence from 3 samples" (weak) from "100% persistence
+    # from 600 samples" (real always-on carrier). Pre-v0.6.3 databases
+    # return sample_count=None; we omit the annotation in that case.
+    n = cluster.sample_count
+    persist_annotated = f"{persist} (n={n})" if n is not None else persist
+    duration_s = max(0.0, (cluster.last_seen - cluster.first_seen).total_seconds())
+    classification = cluster.classification or "unclassified"
+
+    # Span annotation only for multi-bin clusters — single-bin keeps
+    # the original v0.5.36 line shape so people who learned the format
+    # still parse it.
+    if cluster.count > 1:
+        span_khz = (cluster.freq_high_hz - cluster.freq_low_hz) / 1000
+        span = f"  ±{span_khz / 2:.0f}kHz×{cluster.count}bins"
+    else:
+        span = ""
+
+    return (
+        f"{rep:10.3f} MHz  peak={peak}  floor={floor}  "
+        f"persist={persist_annotated}  seen={_humanize_duration(duration_s)}  "
+        f"[{classification}]{span}"
+    )
+
+
+def _format_saturated_band_summary(
+    band_id: str,
+    band_name: str | None,
+    clusters: list[_ChannelCluster],
+) -> list[str]:
+    """Render a saturated-band entry instead of enumerating mysteries.
+
+    When a band has more carriers than _SATURATED_BAND_THRESHOLD even
+    after clustering, listing "top 10 mysteries" is the wrong
+    response — they're not mysteries, they're the band's normal
+    activity that rfcensus doesn't decode. Show the band's character
+    and point at follow-up tools instead.
+    """
+    n = len(clusters)
+    lines: list[str] = []
+
+    label = band_id
+    if band_name and band_name != band_id:
+        label = f"{band_id} – {band_name}"
+    lines.append(
+        f"  {label}  ({n} carriers, band saturated – "
+        f"individual mystery enumeration suppressed)"
+    )
+
+    # Aggregate band character: peak / median / strongest few
+    peaks = [c.peak_power_dbm for c in clusters if c.peak_power_dbm is not None]
+    if peaks:
+        peaks_sorted = sorted(peaks, reverse=True)
+        max_peak = peaks_sorted[0]
+        median = peaks_sorted[len(peaks_sorted) // 2]
+        strong_count = sum(1 for p in peaks if p > median + 10)
+        lines.append(
+            f"    band character: max peak {max_peak:+.1f} dBm, "
+            f"median {median:+.1f} dBm, "
+            f"{strong_count} carrier(s) > median+10 dB"
+        )
+
+    # Strongest by peak — useful even when persistence ranking is useless
+    strongest = sorted(
+        clusters,
+        key=lambda c: c.peak_power_dbm if c.peak_power_dbm is not None else -999,
+        reverse=True,
+    )[:_MAX_STRONGEST_IN_SUMMARY]
+    if strongest:
+        names = []
+        for c in strongest:
+            freq_mhz = c.representative_freq_hz / 1_000_000
+            peak = c.peak_power_dbm
+            if peak is None:
+                names.append(f"{freq_mhz:.3f}")
+            else:
+                names.append(f"{freq_mhz:.3f} ({peak:+.1f} dBm)")
+        lines.append(
+            f"    strongest {len(strongest)}: {', '.join(names)}"
+        )
+
+    lines.append(
+        f"    investigate live with: rfcensus monitor {band_id}"
+    )
+    return lines
+
+
+def _render_band_mystery_section(
+    band_id: str,
+    band_name: str | None,
+    channels: list[ActiveChannelRecord],
+) -> list[str]:
+    """Top-level renderer for one band's slice of the Mystery section.
+
+    Performs clustering, decides between detailed-list and
+    saturated-summary modes, and returns the rendered lines.
+    """
+    clusters = _cluster_adjacent_channels(channels)
+    n = len(clusters)
+    lines: list[str] = []
+
+    if n > _SATURATED_BAND_THRESHOLD:
+        lines.extend(_format_saturated_band_summary(band_id, band_name, clusters))
+        return lines
+
+    # Detailed list. Sort by composite score, fall back on peak power
+    # when scores are zero (e.g. all members have no SNR data).
+    clusters.sort(
+        key=lambda c: (
+            _mystery_score(c),
+            c.peak_power_dbm if c.peak_power_dbm is not None else -999,
+        ),
+        reverse=True,
+    )
+
+    label = band_id
+    if band_name and band_name != band_id:
+        label = f"{band_id} – {band_name}"
+    raw_count = sum(c.count for c in clusters)
+    if raw_count == n:
+        header = f"  {label}  ({n} active)"
+    else:
+        # Note the bin merging so users understand why their 1245-bin
+        # band is now showing 200 entries instead.
+        header = (
+            f"  {label}  ({n} carriers from {raw_count} raw bins after "
+            f"adjacent-bin clustering)"
+        )
+    lines.append(header)
+
+    shown = clusters[:_MAX_UNTRACKED_CHANNELS_PER_BAND]
+    for c in shown:
+        lines.append("    " + _format_cluster(c))
+    if len(clusters) > len(shown):
+        omitted = len(clusters) - len(shown)
+        lines.append(
+            f"    … {omitted} more in {band_id} not shown"
+        )
+    return lines

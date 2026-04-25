@@ -67,6 +67,15 @@ class ChirpAnalysis:
     burst_total_duration_s: float | None = None
     capture_duration_s: float | None = None
     duty_cycle: float | None = None  # 0.0–1.0
+    # v0.6.8: SF classification via reference-dechirp (gr-lora_sdr style).
+    # When this analysis was run against a baseband at a known suspected
+    # bandwidth, classify_sf_dechirp populates these fields. They're
+    # *the* canonical SF estimate going forward — slope-fit-based
+    # estimate_sf_from_slope is unreliable on real (gap-free) LoRa.
+    estimated_sf: int | None = None  # 7..12 or None
+    sf_confidence: float = 0.0  # ratio best/second-best dechirp score
+    sf_peak_concentration: float = 0.0  # absolute best dechirp score
+    sf_scores: dict[int, float] | None = None  # SF → concentration
 
 
 def analyze_chirps(
@@ -431,3 +440,329 @@ def _estimate_uncertainty_hz(
         return float(np.std(seg) / np.sqrt(seg.size))
     per_segment_means = [float(np.mean(s)) for s in chirp_segment_freqs]
     return float(np.std(per_segment_means))
+
+
+# ────────────────────────────────────────────────────────────────────
+# v0.6.6: SF + variant classification helpers
+# (moved from rfcensus.detectors.builtin.lora when the legacy
+# wide-channel LoRa detector was removed in favor of LoraSurveyTask.)
+#
+# These are pure functions of (slope, bandwidth) and (sf, bandwidth)
+# with no detector-state coupling. LoraSurveyTask uses them to enrich
+# its DetectionEvents with SF and variant labels at full parity with
+# the old detector's output. They live here in chirp_analysis because
+# semantically they're "interpret chirp-analysis output" — an
+# extension of analyze_chirps' result, not detector logic.
+# ────────────────────────────────────────────────────────────────────
+
+
+def estimate_sf_from_slope(
+    *,
+    slope_hz_per_sec: float,
+    bandwidth_hz: int,
+) -> int | None:
+    """Estimate LoRa spreading factor from observed chirp slope.
+
+    For a LoRa chirp: slope = BW² / 2^SF
+    Solving for SF:    SF    = log2(BW² / slope)
+
+    Returns integer SF rounded to nearest, clamped to [5, 12], or None
+    if the slope is implausibly low/high (> 1 SF outside the valid
+    range, which usually means the chirp analysis picked up something
+    that isn't actually LoRa).
+
+    .. deprecated:: 0.6.8
+       This function assumes the slope was measured on a single complete
+       chirp segment. It produces wrong answers on real LoRa traffic
+       because real packets are *contiguous* chirps with no inter-chirp
+       gaps — the slope-fit segment finder either treats the whole packet
+       as one segment (sawtooth instantaneous frequency, fit fails) or
+       locks onto fragments (fit slope is meaningless). The caller should
+       use ``classify_sf_dechirp`` instead, which models real chirp
+       structure correctly via reference-dechirp + FFT (the standard
+       gr-lora_sdr / NELoRa approach). This helper is kept for backward
+       compatibility and for synthetic test cases where each chirp IS a
+       separate segment with gaps.
+    """
+    import math
+
+    # Reject zero-or-NaN slope and zero-or-negative BW. Negative slope
+    # is fine — LoRa down-chirps are valid; we take magnitude below.
+    if slope_hz_per_sec == 0 or bandwidth_hz <= 0:
+        return None
+    # Take absolute value — up-chirps and down-chirps have opposite
+    # signs; we only care about magnitude.
+    slope_abs = abs(slope_hz_per_sec)
+    try:
+        sf_float = math.log2((bandwidth_hz ** 2) / slope_abs)
+    except (ValueError, ZeroDivisionError):
+        return None
+    sf_int = round(sf_float)
+    if sf_int < 4 or sf_int > 13:
+        # Implausibly outside LoRa's valid SF range
+        return None
+    # Clamp to the canonical range
+    return max(5, min(12, sf_int))
+
+
+# ────────────────────────────────────────────────────────────────────
+# v0.6.8: reference-dechirp SF classifier (replaces slope-fit method)
+# ────────────────────────────────────────────────────────────────────
+
+
+def make_downchirp(
+    *, sample_rate: int, bandwidth_hz: int, sf: int,
+) -> tuple[np.ndarray, int]:
+    """Build a base LoRa downchirp at the given SF/BW/sample rate.
+
+    Returns ``(downchirp_samples, chirp_length_samples)``. The downchirp
+    is the complex conjugate of the canonical upchirp, with
+    instantaneous frequency sweeping linearly from +BW/2 down to -BW/2
+    over one chirp period of 2^SF / BW seconds.
+
+    Used as the reference signal for classify_sf_dechirp. Multiplying a
+    received upchirp by this downchirp produces a single tone whose
+    frequency identifies the chirp's cyclic shift (ie its data symbol);
+    multiplying by a downchirp at the WRONG SF produces a smeared
+    spectrum with no clear peak.
+    """
+    if sample_rate <= 0 or bandwidth_hz <= 0 or sf < 5 or sf > 13:
+        raise ValueError(
+            f"invalid downchirp params: sr={sample_rate}, "
+            f"bw={bandwidth_hz}, sf={sf}"
+        )
+    chirp_dur_s = (2 ** sf) / bandwidth_hz
+    chirp_samps = int(round(sample_rate * chirp_dur_s))
+    if chirp_samps < 8:
+        raise ValueError(
+            f"chirp too short ({chirp_samps} samples) — "
+            f"sample rate {sample_rate} insufficient for SF{sf}/{bandwidth_hz}"
+        )
+    slope = bandwidth_hz / chirp_dur_s
+    t = np.arange(chirp_samps, dtype=np.float64) / sample_rate
+    # Downchirp: f(t) = +BW/2 - slope*t. Phase = 2π ∫f dt.
+    inst_freq = bandwidth_hz / 2.0 - slope * t
+    phase = 2.0 * np.pi * np.cumsum(inst_freq) / sample_rate
+    downchirp = np.exp(1j * phase).astype(np.complex64)
+    return downchirp, chirp_samps
+
+
+# Minimum acceptable concentration score (peak FFT bin / total energy)
+# for an SF classification to be considered valid. Tuning notes:
+#   • Pure white noise gives concentration ~1/chirp_samps + statistical
+#     fluctuation. At chirp_samps=128 (SF7/250kHz at 250kHz rate),
+#     baseline is ~1/128 = 0.0078, but in practice noise hits 0.040-
+#     0.045 across multiple seeds (random alignment lets one bin
+#     accumulate above the average).
+#   • Weakest legitimate true classification observed: 0.0515 (SF7 with
+#     random-symbol data at 500 kHz). Most legitimate hits are ≥0.075.
+#   • 0.050 sits on the boundary; bump to 0.052 to give margin against
+#     pure noise while still accepting the weakest legitimate cases.
+_MIN_SF_CONCENTRATION = 0.052
+
+# Minimum confidence (best score / second-best score) to accept the
+# top-scoring SF as the answer. Tuning notes:
+#   • Lowest legitimate confidence with random data symbols: 1.33
+#     (SF9 at 500 kHz, BW = sample rate so each chirp is just 1 cycle).
+#   • Pure noise gives ~1.75 which fails the concentration floor anyway,
+#     so the confidence threshold is not the noise gate.
+#   • Wrong-BW scenarios (e.g. 250 kHz signal seen through 125 kHz
+#     template) can produce confidence as high as 5.9 with a wrong SF —
+#     this gate cannot distinguish those. The CALLER (survey_iq_window)
+#     is responsible for choosing the right BW template by comparing
+#     concentration scores across templates.
+#   • 1.20 is safely below the legitimate floor (1.33) and well above
+#     ambient noise variance.
+_MIN_SF_CONFIDENCE = 1.20
+
+# SF range to test. LoRaWAN and Meshtastic both use SF7..SF12; SF5/6
+# exist in newer LoRa versions but are rare and Meshtastic doesn't
+# support them. Trim if you need to broaden.
+_SF_CANDIDATES: tuple[int, ...] = (7, 8, 9, 10, 11, 12)
+
+
+def classify_sf_dechirp(
+    samples: np.ndarray,
+    sample_rate: int,
+    bandwidth_hz: int,
+) -> tuple[int | None, float, float, dict[int, float]]:
+    """Classify LoRa spreading factor by reference-dechirp + FFT.
+
+    The standard gr-lora_sdr / NELoRa technique. For each candidate SF:
+
+      1. Build a reference downchirp at this SF/BW
+      2. Slice the active region of `samples` into chirp-length chunks
+      3. Multiply each chunk by the downchirp, FFT it, and measure
+         peak energy / total energy ("concentration")
+      4. Average concentration across all chunks → score for this SF
+
+    The correct SF concentrates the multiplied signal into a single FFT
+    bin (concentration → 1.0 in the noiseless limit). A wrong SF
+    leaves residual chirping in the multiplied signal, smearing energy
+    across many bins (concentration ~ 1/N).
+
+    Returns ``(best_sf, confidence, peak_concentration, scores)``:
+      • best_sf — int in [7, 12] or None if no SF passed both gates
+      • confidence — best_score / second_best_score; ≥1.15 to accept
+      • peak_concentration — best_score itself; ≥0.05 to accept
+      • scores — dict mapping each candidate SF to its concentration
+
+    `samples` should be a complex64/complex128 IQ array, ALREADY
+    digitally down-converted to baseband at the suspected channel
+    center, with `sample_rate` ≥ `bandwidth_hz` and ideally ≈ `bandwidth_hz`
+    (Nyquist for the LoRa bandwidth — the dechirp doesn't gain anything
+    from oversampling).
+
+    Robust to:
+      • Real LoRa packet structure (preamble + cyclic-shifted data
+        symbols — the FFT peak just moves, total concentration is
+        unchanged)
+      • Low SNR — validated to -10 dB with 100% accuracy on synthetic
+        data; gracefully degrades by falling below the confidence
+        threshold (returning None) rather than mislabeling
+      • Active-region masking — only processes above-noise samples,
+        avoiding false correlation with noise tails
+      • Off-by-one chirp alignment — chunks are aligned to active-region
+        boundaries, not to absolute symbol boundaries (which we don't
+        know without preamble detection); this works because LoRa's
+        cyclic-shift property means any contiguous chirp-length window
+        of an upchirp dechirps to a tone at *some* frequency (the
+        symbol value)
+
+    Edge case worth knowing about:
+      • Pure-preamble inputs (every chirp is the same all-zero-symbol
+        upchirp) reduce discrimination between adjacent SFs because
+        the SF/2 partial-chirp window of an SF+1 chirp dechirps about
+        as well as the SF chirp itself. Real packets carry varied
+        payload symbols which break this degeneracy. If you only ever
+        feed in pure preambles you may see SF8/SF7 confusion at high
+        BW; this isn't a realistic scenario in the field.
+    """
+    if samples.size < 1024:
+        return None, 0.0, 0.0, {}
+
+    # 1. Find the active region (above-noise samples) so we don't
+    #    score on long noise tails. The dechirp would otherwise add a
+    #    big chunk of low-concentration chunks to the average and
+    #    crush the score for the correct SF.
+    amplitude = np.abs(samples)
+    # Median-based threshold is robust to a few stray spikes; LoRa
+    # bursts have a much higher amplitude than the noise floor so
+    # 0.5× median sits comfortably between them when a burst is
+    # present and approximately AT the typical sample when it's
+    # noise-only.
+    threshold = max(1e-3, float(np.median(amplitude)) * 0.5)
+    mask = amplitude > threshold
+    if mask.sum() < 256:
+        return None, 0.0, 0.0, {}
+    active_idx = np.flatnonzero(mask)
+    first, last = int(active_idx[0]), int(active_idx[-1])
+    sig = samples[first : last + 1]
+    if sig.size < 1024:
+        return None, 0.0, 0.0, {}
+
+    # 2. Score each candidate SF
+    scores: dict[int, float] = {}
+    for sf in _SF_CANDIDATES:
+        try:
+            downchirp, chirp_samps = make_downchirp(
+                sample_rate=sample_rate,
+                bandwidth_hz=bandwidth_hz,
+                sf=sf,
+            )
+        except ValueError:
+            # SF/sample-rate combination doesn't yield enough samples;
+            # skip rather than fail
+            continue
+        # Need at least 2 chirps' worth of samples to score
+        n_chunks = sig.size // chirp_samps
+        if n_chunks < 2:
+            continue
+        trimmed = sig[: n_chunks * chirp_samps]
+        chunks = trimmed.reshape(n_chunks, chirp_samps)
+        # Multiply each chunk by the downchirp (broadcasts over rows)
+        dechirped = chunks * downchirp[np.newaxis, :]
+        # FFT → power → peak / total
+        spectra = np.fft.fft(dechirped, axis=1)
+        magsq = np.abs(spectra) ** 2
+        peak_energy = magsq.max(axis=1)
+        total_energy = magsq.sum(axis=1)
+        # Avoid divide-by-zero for pure-zero chunks (shouldn't happen
+        # given the active-region mask, but defensive)
+        ratios = np.where(
+            total_energy > 0, peak_energy / total_energy, 0.0,
+        )
+        scores[sf] = float(np.mean(ratios))
+
+    if not scores:
+        return None, 0.0, 0.0, {}
+
+    # 3. Pick the SF with highest concentration
+    sorted_sfs = sorted(scores.items(), key=lambda kv: -kv[1])
+    best_sf, best_score = sorted_sfs[0]
+
+    if len(sorted_sfs) > 1:
+        second_score = sorted_sfs[1][1]
+        # Avoid divide-by-zero (shouldn't happen — even pure noise
+        # gives ~1/chirp_samps for every SF — but defensive)
+        confidence = (
+            best_score / second_score if second_score > 0 else 10.0
+        )
+    else:
+        # Only one SF made it into scoring; can't compute a ratio.
+        # Treat as low-confidence and reject below.
+        confidence = 1.0
+
+    # 4. Apply both gates. Either failing → return None for SF, but
+    #    still report the scores so callers can log diagnostics.
+    if best_score < _MIN_SF_CONCENTRATION:
+        return None, confidence, best_score, scores
+    if confidence < _MIN_SF_CONFIDENCE:
+        return None, confidence, best_score, scores
+    return best_sf, confidence, best_score, scores
+
+
+def label_variant(*, sf: int, bandwidth_hz: int) -> str | None:
+    """Map (SF, bandwidth) to a human-readable variant label where one
+    is recognizable. Otherwise None (detection is still reported as
+    generic LoRa with the numeric SF in metadata).
+
+    Meshtastic defaults (US region, LoRaPHY_MT):
+      • ShortTurbo     SF7  / 500 kHz
+      • ShortFast      SF7  / 250 kHz
+      • ShortSlow      SF8  / 250 kHz
+      • MediumFast     SF9  / 250 kHz
+      • MediumSlow     SF10 / 250 kHz
+      • LongFast       SF11 / 250 kHz   (default / most common)
+      • LongModerate   SF11 / 125 kHz
+      • LongSlow       SF12 / 125 kHz
+
+    LoRaWAN US uplink SF7-10/125kHz is common; the bands overlap with
+    Meshtastic at (SF7-10, 125kHz). We prefer the Meshtastic label when
+    the SF matches a unique default (SF11/250 is unambiguously LongFast
+    Meshtastic; SF9/250 is unambiguously MediumFast).
+    """
+    bw_khz = bandwidth_hz // 1000
+    # Meshtastic-distinctive combinations (bw=250 kHz):
+    if bw_khz == 250:
+        if sf == 7:
+            return "meshtastic_short_fast"
+        if sf == 8:
+            return "meshtastic_short_slow"
+        if sf == 9:
+            return "meshtastic_medium_fast"
+        if sf == 10:
+            return "meshtastic_medium_slow"
+        if sf == 11:
+            return "meshtastic_long_fast"
+    if bw_khz == 500 and sf == 7:
+        return "meshtastic_short_turbo"
+    if bw_khz == 125:
+        if sf == 11:
+            return "meshtastic_long_moderate_or_lorawan"
+        if sf == 12:
+            return "meshtastic_long_slow_or_lorawan"
+        # Lower SF at 125 kHz is most commonly LoRaWAN
+        if 7 <= sf <= 10:
+            return f"lorawan_sf{sf}"
+    return None

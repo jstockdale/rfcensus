@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Final
 
-SCHEMA_VERSION: Final[int] = 2
+SCHEMA_VERSION: Final[int] = 3
 
 
 def apply_migrations(conn: sqlite3.Connection) -> None:
@@ -23,6 +23,9 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     if current < 2:
         _v2(conn)
         conn.execute("PRAGMA user_version = 2")
+    if current < 3:
+        _v3(conn)
+        conn.execute("PRAGMA user_version = 3")
     conn.commit()
 
 
@@ -85,6 +88,7 @@ def _v1(conn: sqlite3.Connection) -> None:
             noise_floor_dbm     REAL,
             classification      TEXT,
             persistence_ratio   REAL,
+            sample_count        INTEGER,
             confidence          REAL,
             metadata            TEXT
         );
@@ -189,5 +193,34 @@ def _v2(conn: sqlite3.Connection) -> None:
             ON detections(technology);
 
         ALTER TABLE sessions ADD COLUMN is_baseline INTEGER DEFAULT 0;
+        """
+    )
+
+
+def _v3(conn: sqlite3.Connection) -> None:
+    """v0.6.3: add active_channels.sample_count column.
+
+    Pre-v0.6.3 databases stored persistence_ratio computed with the
+    buggy `min(1.0, sample_count / 60.0)` formula. That formula is
+    fixed upstream in occupancy.py (now emits the real active/total
+    ratio), and we additionally persist the raw sample_count so
+    consumers can tell whether a ratio like "100%" came from 1/1
+    samples or from 580/600 samples.
+
+    Existing rows from older sessions will have NULL sample_count;
+    the record loaders handle NULL gracefully. We don't backfill
+    because the old data genuinely doesn't contain this information.
+
+    Guarded: _v1 has been updated to include sample_count on fresh
+    databases, so a fresh DB runs v1→v2→v3 with the column already
+    present. Skip the ALTER in that case. SQLite provides no
+    "IF NOT EXISTS" for ADD COLUMN so we introspect pragma output.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(active_channels)")}
+    if "sample_count" in existing:
+        return
+    conn.executescript(
+        """
+        ALTER TABLE active_channels ADD COLUMN sample_count INTEGER;
         """
     )

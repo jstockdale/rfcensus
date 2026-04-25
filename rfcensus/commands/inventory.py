@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 
@@ -75,7 +76,23 @@ def _build_inventory_cli(
     help_text: str,
     *,
     default_per_band: str | None = None,
+    honor_pins: bool = False,
 ):
+    """Factory for the inventory/scan/hybrid command trio.
+
+    They share most flags + flow; the differences are:
+      • default_duration — "5m" for scan, "forever" for inventory & hybrid
+      • default_per_band — "1m" for inventory/hybrid, None for scan
+      • honor_pins — True ONLY for hybrid. When False:
+          - --pin and --allow-pin-antenna-mismatch errors-out as a
+            "use rfcensus hybrid" redirect (the flags still appear in
+            --help so users discover the feature)
+          - Pins declared in site.toml print a one-line warning at
+            startup ("ignored — use 'rfcensus hybrid'") then are dropped
+        When True:
+          - Both flags work normally
+          - Config-declared pins are honored
+    """
     @click.command(name=command_name, help=help_text)
     @click.option("--config", "config_path", type=click.Path(path_type=Path))
     @click.option(
@@ -166,6 +183,49 @@ def _build_inventory_cli(
             "the dongles are busy and the scan fails mysteriously."
         ),
     )
+    @click.option(
+        "--pin",
+        "pin_strings",
+        multiple=True,
+        metavar="DONGLE:DECODER@FREQ[:SR]",
+        help=(
+            "Pin a decoder to a dongle for the entire session. "
+            f"{'Honored by `hybrid` only.' if not honor_pins else ''}"
+            " The dongle is leased exclusively at startup and runs "
+            "the named decoder at the named frequency until the "
+            "session ends. Repeat --pin for multiple. Format examples: "
+            "'00000043:rtl_433@433.92M' or "
+            "'00000043:rtl_433@433920000:2400000'. "
+            f"{'Use `rfcensus hybrid` to pin dongles; `inventory` and `scan` ignore pins on purpose.' if not honor_pins else 'CLI pins override config-declared pins on the same dongle.'}"
+        ),
+    )
+    @click.option(
+        "--allow-pin-antenna-mismatch",
+        is_flag=True,
+        help=(
+            "Allow pinning a decoder to a dongle whose antenna "
+            "doesn't cover the pin's frequency. "
+            f"{'Only meaningful with `rfcensus hybrid`.' if not honor_pins else 'Default is to refuse such pins as almost-certainly-typos.'}"
+        ),
+    )
+    @click.option(
+        "--tui",
+        is_flag=True,
+        help=(
+            "Launch the interactive dashboard while the scan runs. "
+            "Requires a TTY at least 80×24. Falls back to log mode "
+            "with a one-line notice if the terminal is too small "
+            "or stdout is piped."
+        ),
+    )
+    @click.option(
+        "--no-color",
+        is_flag=True,
+        help=(
+            "Disable color output in the dashboard and log. Honors "
+            "the NO_COLOR env var as well."
+        ),
+    )
     def cli(
         config_path: Path | None,
         duration: str,
@@ -180,6 +240,10 @@ def _build_inventory_cli(
         until_quiet: str | None,
         guided: bool,
         kill_orphans: bool,
+        pin_strings: tuple[str, ...],
+        allow_pin_antenna_mismatch: bool,
+        tui: bool,
+        no_color: bool,
     ) -> None:
         run_async(
             _run(
@@ -197,6 +261,11 @@ def _build_inventory_cli(
                 guided=guided,
                 kill_orphans=kill_orphans,
                 command_name=command_name,
+                pin_strings=list(pin_strings),
+                allow_pin_antenna_mismatch=allow_pin_antenna_mismatch,
+                honor_pins=honor_pins,
+                tui=tui,
+                no_color=no_color,
             )
         )
 
@@ -219,7 +288,28 @@ async def _run(
     guided: bool,
     kill_orphans: bool,
     command_name: str,
+    pin_strings: list[str] | None = None,
+    allow_pin_antenna_mismatch: bool = False,
+    honor_pins: bool = False,
+    tui: bool = False,
+    no_color: bool = False,
 ) -> None:
+    # Hard error if user passed --pin to a command that doesn't honor
+    # it. Footgun: silently ignoring --pin would mean the user thinks
+    # they pinned a dongle and finds out later they didn't. Better to
+    # fail loudly with a redirect.
+    if pin_strings and not honor_pins:
+        raise click.BadParameter(
+            f"--pin requires the `hybrid` subcommand. "
+            f"`{command_name}` ignores pins on purpose so accidental "
+            f"persistent config doesn't break your scan. Try: "
+            f"`rfcensus hybrid --pin {pin_strings[0]}`"
+        )
+    if allow_pin_antenna_mismatch and not honor_pins:
+        raise click.BadParameter(
+            f"--allow-pin-antenna-mismatch only applies when pins are "
+            f"in use. Use it with `rfcensus hybrid`."
+        )
     # Guided mode is single-pass-only by design. Round-robin or
     # indefinite would prompt the user dozens of times — hostile.
     if guided and (per_band or duration in ("0", "forever", "indefinite", "inf")):
@@ -530,6 +620,43 @@ async def _run(
             config_path or rt.config.source_path or Path("~/.config/rfcensus/site.toml").expanduser(),
         )
 
+    # v0.6.0: build the pin spec list (only if this command honors pins).
+    # When not honored: warn at startup so users notice they have pins
+    # in config that aren't doing anything in this command, then drop them.
+    pin_specs = []
+    config_pins = [d for d in rt.config.dongles if d.pin is not None]
+    if honor_pins:
+        if pin_strings or config_pins:
+            from rfcensus.engine.pinning import gather_pins
+            try:
+                pin_specs = gather_pins(rt.config, pin_strings)
+            except ValueError as exc:
+                raise click.BadParameter(f"--pin: {exc}") from None
+            if pin_specs:
+                click.echo(
+                    f"Pinning {len(pin_specs)} dongle(s) for this session:",
+                    err=True,
+                )
+                for spec in pin_specs:
+                    src = (
+                        "(config)"
+                        if spec.source == "config"
+                        else "(--pin)"
+                    )
+                    click.echo(
+                        f"  • {spec.dongle_id} → {spec.decoder} @ "
+                        f"{spec.freq_hz / 1e6:.3f} MHz {src}",
+                        err=True,
+                    )
+    else:
+        if config_pins:
+            click.echo(
+                f"Note: {len(config_pins)} pin(s) in config will be "
+                f"ignored — `{command_name}` doesn't honor pins. "
+                f"Use `rfcensus hybrid` to honor them.",
+                err=True,
+            )
+
     runner = SessionRunner(
         command=command_name,
         config=rt.config,
@@ -548,6 +675,8 @@ async def _run(
         # prompt about busy dongles before committing to the scan),
         # so skip the duplicate check inside the runner.
         skip_health_check=True,
+        pin_specs=pin_specs,
+        allow_pin_antenna_mismatch=allow_pin_antenna_mismatch,
     )
 
     # Simple progress line: emit a one-liner per new emitter and per confirmed one.
@@ -560,7 +689,9 @@ async def _run(
         elif event.kind == "confirmed":
             click.echo(
                 f"[confirmed] {event.protocol:<16s} "
-                f"{event.device_id_hash:<12s}  conf={event.confidence:.2f}"
+                f"{event.device_id_hash:<12s}  "
+                f"{event.typical_freq_hz/1e6:.3f} MHz  "
+                f"conf={event.confidence:.2f}"
             )
 
     runner.event_bus.subscribe(EmitterEvent, _on_emitter)
@@ -575,15 +706,109 @@ async def _run(
     runner.event_bus.subscribe(DecodeEvent, _on_decode)
 
     if indefinite:
+        # Educational startup banner. The point of indefinite is to
+        # leave it running and check back later. The banner tells the
+        # user (in the first second on screen) how to opt back into a
+        # finite run if that's what they actually wanted, and points
+        # at --until-quiet which is almost always what unattended
+        # users actually want ("run until nothing new for X, then exit").
         click.echo(
-            f"Running {command_name} indefinitely with {len(rt.registry.usable())} "
-            f"dongle(s) (Ctrl-C to exit cleanly, Ctrl-C twice to force)..."
+            f"Running {command_name} indefinitely with "
+            f"{len(rt.registry.usable())} dongle(s). "
+            f"Ctrl-C to exit cleanly (twice to force).",
+            err=True,
+        )
+        click.echo(
+            "  Tip: --duration 1h for a finite run, or "
+            "--until-quiet 30m to exit automatically when the site "
+            "goes quiet.",
+            err=True,
         )
     else:
         click.echo(
             f"Running {command_name} for {duration_s:.0f}s with "
             f"{len(rt.registry.usable())} dongle(s)..."
         )
+
+    # v0.6.5: --tui launches the dashboard alongside runner.run().
+    # Falls back to log mode if the terminal is too small or stdout
+    # is piped. Color is disabled if --no-color or NO_COLOR is set.
+    if tui:
+        from rfcensus.tui.app import TUIApp, check_tty_and_size
+        ok, msg = check_tty_and_size()
+        if not ok:
+            click.echo(
+                f"--tui unavailable ({msg}); falling back to log mode.",
+                err=True,
+            )
+        else:
+            from rfcensus.tui.color import detect_color_support
+            color_enabled = detect_color_support() and not no_color
+            tui_app = TUIApp(
+                runner=runner,
+                no_color=not color_enabled,
+                site_name=rt.config.site.name,
+            )
+
+            # Run runner + TUI concurrently. Whichever finishes first,
+            # cancel the other. Runner finishing means scan is done;
+            # TUI finishing means user hit q (which calls
+            # runner.request_stop) or l (log-mode toggle).
+            runner_task = asyncio.create_task(
+                runner.run(), name="rfcensus-runner",
+            )
+            tui_task = asyncio.create_task(
+                tui_app.run_async(), name="rfcensus-tui",
+            )
+
+            done, pending = await asyncio.wait(
+                {runner_task, tui_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Cancel the other side cleanly
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+            # Get the runner result. If runner crashed, propagate.
+            if runner_task in done:
+                result = runner_task.result()
+            else:
+                # TUI exited first (q or l). If it was l, we still
+                # need to wait for runner to finish naturally.
+                if not runner.control.stopped.is_set() and not runner._stop_requested:
+                    # Log-mode: just await the runner to completion
+                    click.echo(
+                        "\n[log mode — TUI closed; scan continues "
+                        "in foreground]\n",
+                        err=True,
+                    )
+                    result = await runner_task
+                else:
+                    # Quit confirmed: runner is shutting down
+                    result = await runner_task
+
+            builder = ReportBuilder(rt.db)
+            report = await builder.render(
+                result,
+                fmt="json" if as_json else "text",
+                include_ids=include_ids,
+                site_name=rt.config.site.name,
+            )
+
+            if output:
+                output.write_text(report, encoding="utf-8")
+                click.echo(f"\nReport written to {output}")
+            else:
+                click.echo("\n" + report)
+            click.echo("\n73 🛰️")
+            return
+
+    # Non-TUI path (original behavior)
     result = await runner.run()
 
     builder = ReportBuilder(rt.db)
@@ -602,22 +827,42 @@ async def _run(
 
 
 cli_inventory = _build_inventory_cli(
-    default_duration="1h",
+    default_duration="forever",
     command_name="inventory",
     help_text=(
-        "Run a thorough multi-pass site survey. Loops through every band "
-        "many times to catch transient signals (key fobs, garage doors, "
-        "occasional sensor reports). For a quick read instead, use `scan`."
+        "Run an exhaustive multi-pass site survey. Defaults to running "
+        "until you Ctrl-C — intermittent emitters (paging once an hour, "
+        "security sensors that only chirp on events) need long runs to "
+        "catch. Use `scan` for a quick read, or `hybrid` if you want to "
+        "dedicate some dongles to specific decoders while the rest "
+        "explore."
     ),
     default_per_band="1m",  # Round-robin: 1 minute per band per pass
+    honor_pins=False,
 )
 cli_scan = _build_inventory_cli(
     default_duration="5m",
     command_name="scan",
     help_text=(
         "Quick single-pass scan of enabled bands. Each band gets one "
-        "longer dwell window. For a thorough multi-pass survey, use "
-        "`inventory` instead."
+        "longer dwell window. Use this to figure out what's at a site; "
+        "follow up with `inventory` for thorough enumeration or "
+        "`hybrid` for pinned-decoder + scheduler runs."
     ),
     default_per_band=None,  # Single pass; duration divided evenly
+    honor_pins=False,
+)
+cli_hybrid = _build_inventory_cli(
+    default_duration="forever",
+    command_name="hybrid",
+    help_text=(
+        "Inventory + dedicated decoder pinning. Honors `[dongles.pin]` "
+        "from your site.toml plus any --pin CLI flags. Pinned dongles "
+        "run their decoder for the full session; the rest do the "
+        "normal exploration scan in parallel. Defaults to running "
+        "until you Ctrl-C — pinning's main use case is gap-free "
+        "long-running coverage of specific targets."
+    ),
+    default_per_band="1m",  # Round-robin for the unpinned dongles
+    honor_pins=True,
 )

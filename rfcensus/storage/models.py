@@ -59,6 +59,12 @@ class ActiveChannelRecord:
     noise_floor_dbm: float | None = None
     classification: str | None = None
     persistence_ratio: float | None = None
+    # v0.6.3: total samples observed at this bin during tracking.
+    # Needed so consumers can gate on whether persistence_ratio has
+    # accumulated enough evidence to be trustworthy (a 100%-persistent
+    # channel with sample_count=2 is not the same as 100% with n=600).
+    # Nullable for rows written by pre-v0.6.3 versions of rfcensus.
+    sample_count: int | None = None
     confidence: float | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 

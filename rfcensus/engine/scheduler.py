@@ -41,14 +41,11 @@ class ScheduleTask:
     # pool can't host them all in parallel (v0.5.35). Set elements are
     # decoder names (e.g. "multimon", "direwolf").
     allowed_decoders: set[str] | None = None
-    # v0.5.41: if set, this task is a LoRa confirmation batch (not a
-    # normal strategy run). The session dispatch checks this field
-    # first and routes to run_batched_confirmation() when present,
-    # which allocates the suggested dongle exclusively, captures IQ
-    # at the cluster's center frequency, and classifies each task in
-    # the cluster via DDC + chirp analysis. The `band` field is
-    # synthesized to cover the cluster's span for antenna matching.
-    confirmation_cluster: object | None = None  # BatchedConfirmationTask
+    # v0.6.6: confirmation_cluster field removed alongside the legacy
+    # LoRa confirmation queue (LoraDetector + ConfirmationQueue +
+    # confirmation_task). LoraSurveyTask runs its IQ analysis inline
+    # via survey_iq_window so there's no longer a deferred-confirmation
+    # path that needs a special schedule-task variant.
 
 
 def _estimate_dongle_needs(

@@ -175,6 +175,37 @@ class OccupancyAnalyzer:
                 await self._expire(sample.freq_hz)
 
     async def _emit(self, state: _ActiveState, kind: str) -> None:
+        # v0.6.3: persistence_ratio is now computed from the tracked
+        # ChannelHistory's total_active_samples / total_samples. The
+        # pre-v0.6.3 formula `min(1.0, state.sample_count / 60.0)` was
+        # a sample-count CAP masquerading as a ratio — any bin seen
+        # for ≥60 sweeps reported 100% regardless of how often it was
+        # actually above the noise floor, which made the mystery-
+        # carrier report's persistence column useless in busy bands
+        # (everything showed 100%).
+        #
+        # history.total_active_samples counts sweeps where this bin
+        # was above_floor; history.total_samples counts all sweeps
+        # where we observed this bin (active or not). Ratio is then
+        # "what fraction of the time was this carrier actually on?"
+        # which is what "persistence" should mean.
+        #
+        # If for some reason the history doesn't exist yet (first
+        # emission is concurrent with the observe() call that created
+        # it, or an edge case under cancellation), fall back to the
+        # state's own above-floor sample count / 1 to avoid ZeroDiv.
+        history = self._histories.get(state.freq_hz)
+        if history is not None and history.total_samples > 0:
+            persistence = history.total_active_samples / history.total_samples
+            total_samples = history.total_samples
+        else:
+            # Defensive fallback — if history is missing we have no
+            # below-floor denominator to divide by, so the ratio is
+            # definitionally 1.0 (every observation we have was
+            # above-floor, by construction of state being in _active).
+            persistence = 1.0
+            total_samples = state.sample_count
+
         await self.event_bus.publish(
             ActiveChannelEvent(
                 session_id=self.session_id,
@@ -187,7 +218,8 @@ class OccupancyAnalyzer:
                 noise_floor_dbm=state.noise_floor,
                 snr_db=state.peak_power - state.noise_floor,
                 classification=state.classification.kind,
-                persistence_ratio=min(1.0, state.sample_count / 60.0),
+                persistence_ratio=persistence,
+                sample_count=total_samples,
                 confidence=state.classification.confidence,
             )
         )

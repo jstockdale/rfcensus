@@ -396,10 +396,16 @@ class TestTextReportActiveChannelsSection:
 
     def test_truncation_per_band(self):
         """When a band has more channels than the per-band cap, the
-        extras are summarized rather than dumped."""
+        extras are summarized rather than dumped.
+
+        v0.6.2: spaced 100 kHz apart so they each form their own
+        cluster (channels within _ADJACENT_CLUSTER_WINDOW_HZ now merge,
+        which would collapse the original 10-kHz-spaced fixture into
+        a single cluster — accurate behavior, but defeats the
+        truncation check this test exists for)."""
         channels = [
             _active_channel(
-                freq_hz=915_000_000 + 10_000 * i,
+                freq_hz=915_000_000 + 100_000 * i,
                 persistence=0.5 - 0.01 * i,
             )
             for i in range(_MAX_UNTRACKED_CHANNELS_PER_BAND + 5)

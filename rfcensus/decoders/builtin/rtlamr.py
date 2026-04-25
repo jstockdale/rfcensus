@@ -36,8 +36,21 @@ class RtlamrDecoder(DecoderBase):
         name="rtlamr",
         protocols=["ert_scm", "ert_scm_plus", "ert_idm", "ert_netidm", "r900", "r900_bcd"],
         freq_ranges=((902_000_000, 928_000_000),),
-        min_sample_rate=2_048_000,
-        preferred_sample_rate=2_400_000,
+        # v0.6.9: rtlamr's demodulator HARD-CODES 2,359,296 Hz as its
+        # sample rate. DataRate (32768), ChipLength (72),
+        # PreambleLength (4608), PacketLength (105984) are all
+        # derived from that exact value. Feeding rtlamr any other
+        # rate either causes its rtltcp client to send a
+        # set_sample_rate(2359296) command upstream (corrupting the
+        # stream for any other shared client — the v0.6.8 fanout
+        # filter now disconnects rtlamr in this case) or, if the
+        # filter weren't there, would silently produce broken decodes.
+        # Declaring 2,359,296 as preferred + requires_exact lets the
+        # band-level rate-picker establish the shared slot at the
+        # right rate for everyone.
+        min_sample_rate=2_359_296,
+        preferred_sample_rate=2_359_296,
+        requires_exact_sample_rate=True,
         requires_exclusive_dongle=False,  # Connects via rtl_tcp
         external_binary="rtlamr",
         cpu_cost="cheap",

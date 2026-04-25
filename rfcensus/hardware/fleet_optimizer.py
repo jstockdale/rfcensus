@@ -76,6 +76,7 @@ def optimize_fleet(
     dongles: list[Dongle],
     enabled_bands: list[BandConfig],
     available_antennas: list[Antenna],
+    pinned_freqs: dict[str, int] | None = None,
 ) -> FleetPlan:
     """Find the best antenna assignment for the given dongles.
 
@@ -83,6 +84,12 @@ def optimize_fleet(
     typical SDR fleets (3-8 dongles, ~10 antennas) this is well under
     100M evaluations. We add a "no antenna" slot to allow leaving a
     dongle unassigned when no antenna helps.
+
+    v0.6.0 — `pinned_freqs` (dongle_id → freq_hz) constrains the
+    optimizer for pinned dongles: their antenna MUST cover the pin
+    frequency at >= WELL_COVERED_THRESHOLD. Without this, the
+    optimizer might suggest swapping the antenna on a pinned dongle
+    to one that's better for some unrelated band, breaking the pin.
     """
     if not dongles:
         return FleetPlan()
@@ -91,18 +98,50 @@ def optimize_fleet(
     if not usable_dongles:
         return FleetPlan()
 
+    pinned_freqs = pinned_freqs or {}
+
     # Per-dongle, only consider antennas that could plausibly cover at
-    # least one enabled band (filters huge fleets quickly)
+    # least one enabled band (filters huge fleets quickly). For pinned
+    # dongles, additionally require the antenna to cover the pin freq
+    # well — pinning is the user's explicit intent and the optimizer
+    # must not break it.
     per_dongle_options: list[list[Antenna | None]] = []
     for d in usable_dongles:
-        plausible: list[Antenna | None] = [None]
-        for ant in available_antennas:
-            for band in enabled_bands:
-                if not d.covers(band.center_hz):
+        pin_freq = pinned_freqs.get(d.id)
+        if pin_freq is not None:
+            # Pinned: antenna is MANDATORY (no None option). The pin's
+            # antenna must cover the pin freq at well-covered level.
+            # If the catalog has nothing suitable, the pinned dongle
+            # ends up with no acceptable assignment — surface as a
+            # coverage gap rather than silently swapping to None.
+            plausible: list[Antenna | None] = []
+            from rfcensus.config.schema import BandConfig as _BC
+            synth = _BC(
+                id=f"_pin_{d.id}",
+                name="pin",
+                freq_low=pin_freq - 1000,
+                freq_high=pin_freq + 1000,
+            )
+            for ant in available_antennas:
+                if not ant.covers(pin_freq):
                     continue
-                if ant.suitability_for_band(band) >= 0.3:
+                if ant.suitability_for_band(synth) >= WELL_COVERED_THRESHOLD:
                     plausible.append(ant)
-                    break  # at least one band works; include this antenna
+            if not plausible:
+                # No catalog antenna can satisfy the pin — record a
+                # None placeholder so the optimizer doesn't crash; the
+                # downstream uncovered_bands logic will surface this.
+                plausible.append(None)
+        else:
+            # Unpinned: original logic
+            plausible = [None]
+            for ant in available_antennas:
+                for band in enabled_bands:
+                    if not d.covers(band.center_hz):
+                        continue
+                    if ant.suitability_for_band(band) >= 0.3:
+                        plausible.append(ant)
+                        break  # at least one band works; include this antenna
         per_dongle_options.append(plausible)
 
     # Brute force the assignment. With per-dongle filtering most fleets

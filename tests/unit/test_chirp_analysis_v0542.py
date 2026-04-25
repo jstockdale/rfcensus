@@ -17,7 +17,7 @@ import pytest
 
 from rfcensus.spectrum.chirp_analysis import analyze_chirps
 
-from tests.unit.test_confirmation_task import _synthesize_lora_chirp
+from tests.unit._dsp_fixtures import _synthesize_lora_chirp
 
 
 SAMPLE_RATE = 2_400_000  # production rate; vectorized analyze_chirps

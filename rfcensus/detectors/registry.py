@@ -36,9 +36,17 @@ def get_registry() -> DetectorRegistry:
     global _REGISTRY
     if _REGISTRY is None:
         _REGISTRY = DetectorRegistry()
-        from rfcensus.detectors.builtin import lora, p25, wifi_bt  # noqa: F401
+        # v0.6.6: LoraDetector removed in favor of LoraSurveyTask
+        # (rfcensus/engine/lora_survey_task.py). The old detector
+        # operated on WideChannelEvents from rtl_power-driven
+        # bin aggregation, which structurally cannot resolve LoRa's
+        # ms-scale chirps with rtl_power's sequential bin sweeping.
+        # The new survey task taps the band's shared rtl_tcp fanout
+        # directly for continuous IQ. WideChannelAggregator and
+        # consumes_wide_channels remain available for future
+        # detectors that operate on wide-channel patterns.
+        from rfcensus.detectors.builtin import p25, wifi_bt  # noqa: F401
 
-        _REGISTRY.register(lora.LoraDetector)
         _REGISTRY.register(p25.P25Detector)
         _REGISTRY.register(wifi_bt.WifiBtDetector)
     return _REGISTRY

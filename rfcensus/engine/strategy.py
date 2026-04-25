@@ -172,6 +172,23 @@ class DecoderPrimaryStrategy(Strategy):
             )
             result.power_scan_performed = True
 
+        # v0.6.5: LoRa survey sidecar. Taps the band's shared fanout
+        # (already running for rtl_433 / rtlamr) and runs continuous
+        # chirp-pattern detection on the streaming IQ. Bypasses the
+        # rtl_power-based aggregator entirely — see lora_survey_task.py
+        # for why that was structurally broken. Deferred 2s so the
+        # primary fanout has come up and the shared lease can attach.
+        if band.lora_survey:
+            async def _deferred_lora_survey():
+                await asyncio.sleep(2.0)
+                return await _run_lora_survey(band, ctx)
+            tasks.append(
+                asyncio.create_task(
+                    _deferred_lora_survey(),
+                    name=f"lora_survey-{band.id}",
+                )
+            )
+
         task_results = await asyncio.gather(*tasks, return_exceptions=True)
         for tr in task_results:
             if isinstance(tr, Exception):
@@ -182,6 +199,12 @@ class DecoderPrimaryStrategy(Strategy):
             if hasattr(tr, "decodes_emitted"):
                 result.decodes_emitted += tr.decodes_emitted
                 result.errors.extend(tr.errors)
+            elif hasattr(tr, "detections_emitted"):
+                # LoraSurveyStats: not a decoder, but its errors are
+                # worth surfacing in the strategy result so they end
+                # up in the session report.
+                if getattr(tr, "errors", None):
+                    result.errors.extend(tr.errors)
         return result
 
 
@@ -278,6 +301,66 @@ def _pick_decoders(
     return chosen
 
 
+def _band_shared_sample_rate(
+    band: BandConfig, ctx: StrategyContext
+) -> int:
+    """Decide the sample rate for the band's shared rtl_tcp slot
+    deterministically, BEFORE any decoder allocates.
+
+    v0.6.9: previously each decoder requested its own
+    preferred_sample_rate and whoever allocated first established the
+    slot rate. Late joiners with incompatible rate assumptions either
+    silently produced wrong output (rate close enough that broker
+    accepted but math wrong — rtlamr at 2,400,000 Hz vs its hardcoded
+    2,359,296 Hz constants) or got disconnected by the v0.6.8 fanout
+    filter (loud failure, but still a failure). Either way, the
+    outcome depended on allocation order, which depended on async
+    scheduling — non-deterministic.
+
+    Now: the band knows which decoders WILL run on it. We compute the
+    one rate that satisfies all of them up front:
+
+      • If any decoder declares requires_exact_sample_rate, that rate
+        wins. (If two such decoders disagree, we'd have an
+        unsatisfiable band — currently this can't happen with our
+        decoder set; if it ever does, we log loudly and pick one.)
+      • Otherwise: max(preferred_sample_rate) across the decoders.
+        Higher rate gives more bandwidth, and any decoder happy with
+        a lower rate is also happy with a higher one (since
+        min_sample_rate is a floor not a ceiling).
+
+    Returns the chosen rate in Hz. Caller is responsible for using
+    this rate everywhere — both in the broker allocation request AND
+    in the DecoderRunSpec passed to the decoder. That ensures the
+    decoder's command-line args (e.g. `rtl_433 -s 2359296`) match
+    what the fanout's actually serving.
+    """
+    decoders = _pick_decoders(band, ctx)
+    if not decoders:
+        return 2_400_000  # band has no decoders; lora_survey-only path
+
+    exact = [d.capabilities for d in decoders if d.capabilities.requires_exact_sample_rate]
+    if exact:
+        # All exact-rate decoders must agree, or the band is broken.
+        rates = {d.preferred_sample_rate for d in exact}
+        if len(rates) > 1:
+            # Unsatisfiable — pick the lowest and warn. An admin
+            # reading the log will see WHY their decode counts are
+            # zero on this band.
+            chosen = min(rates)
+            log.warning(
+                "band %s has %d decoders with conflicting exact-rate "
+                "requirements: %s. Using %d Hz; other decoders will "
+                "produce broken output. Move them to separate bands "
+                "or different dongles.",
+                band.id, len(exact), sorted(rates), chosen,
+            )
+            return chosen
+        return rates.pop()
+
+    return max(d.capabilities.preferred_sample_rate for d in decoders)
+
+
 def _should_power_scan(band: BandConfig, ctx: StrategyContext) -> bool:
     """Should we run a power scan alongside decoders?
 
@@ -295,12 +378,26 @@ def _should_power_scan(band: BandConfig, ctx: StrategyContext) -> bool:
 async def _run_decoder_on_band(
     band: BandConfig, decoder: DecoderBase, ctx: StrategyContext
 ):
+    # v0.6.9: ALL decoders on this band request the same shared-slot
+    # rate, decided up-front from the band's full decoder cohort. Two
+    # consequences:
+    #   1. The broker creates the slot at this rate the first time it
+    #      sees the band — order of allocation no longer matters.
+    #   2. The DecoderRunSpec carries this rate too, so the decoder's
+    #      command-line args (e.g. `rtl_433 -s 2359296`) match what
+    #      the fanout's actually serving. Without this, rtl_433 would
+    #      tell the upstream "I want 2,400,000" mid-stream and (a) get
+    #      filtered by the v0.6.8 fanout if it conflicts, or (b)
+    #      process samples assuming the wrong clock if it doesn't.
+    band_rate = _band_shared_sample_rate(band, ctx)
     requirements = DongleRequirements(
         freq_hz=band.center_hz,
-        sample_rate=decoder.capabilities.preferred_sample_rate,
+        sample_rate=band_rate,
         access_mode=decoder.capabilities.access_mode,
         prefer_driver="rtlsdr",
         require_suitable_antenna=not ctx.all_bands,
+        band_id=band.id,
+        require_exact_sample_rate=decoder.capabilities.requires_exact_sample_rate,
     )
     try:
         lease = await ctx.broker.allocate(
@@ -315,7 +412,7 @@ async def _run_decoder_on_band(
         run_spec = DecoderRunSpec(
             lease=lease,
             freq_hz=band.center_hz,
-            sample_rate=decoder.capabilities.preferred_sample_rate,
+            sample_rate=band_rate,
             duration_s=ctx.duration_s,
             event_bus=ctx.event_bus,
             session_id=ctx.session_id,
@@ -325,6 +422,31 @@ async def _run_decoder_on_band(
         run_started = asyncio.get_event_loop().time()
         result = await decoder.run(run_spec)
         run_elapsed = asyncio.get_event_loop().time() - run_started
+
+        # v0.6.7: surface ANY meaningfully early exit, not just the
+        # < 5s "definitely hardware lost" case. We observed 74-122s
+        # exits with -T 720 in v0.6.6 multi-decoder scans and had no
+        # log line explaining why. Even if it's not a hardware loss,
+        # the user wants to know "your decoder gave up early and
+        # here's the elapsed time."
+        if (
+            ctx.duration_s
+            and run_elapsed < ctx.duration_s * 0.5
+            and result.ended_reason not in {
+                "binary_missing", "rtl_tcp_not_ready",
+                "wrong_lease_type", "user_skipped", "hardware_lost",
+            }
+        ):
+            log.warning(
+                "decoder %s on %s exited early at %.1fs "
+                "(expected %.0fs, %d decode(s) emitted, errors=%s). "
+                "Check the decoder's stderr above for clues. Common "
+                "causes: rtl_tcp protocol mismatch, sample-rate "
+                "negotiation conflict with another shared client, "
+                "or rtl_433/rtlamr internal buffer overflow.",
+                decoder.name, band.id, run_elapsed,
+                ctx.duration_s, result.decodes_emitted, result.errors,
+            )
 
         # Detect suspected hardware loss: decoder exited way before its
         # requested duration, with no decodes emitted. Most often this
@@ -349,11 +471,33 @@ async def _run_decoder_on_band(
             "binary_missing", "rtl_tcp_not_ready", "wrong_lease_type",
             "user_skipped",
         }
+        # v0.6.9: live-cohort escape hatch. Even if all the conditions
+        # above match, if the dongle currently has OTHER active leases,
+        # the dongle is clearly alive — this decoder's early exit is a
+        # decoder-specific issue (e.g. shared-mode fanout disconnected
+        # this client for a command conflict, while the other client
+        # keeps streaming happily).
+        #
+        # Without this guard, v0.6.8's command-rejection feature
+        # produced a regression: when the fanout disconnected rtlamr
+        # for requesting set_sample_rate(2359296), rtlamr exited at
+        # 0.1s, the heuristic mistakenly marked the dongle FAILED, and
+        # subsequent shared-lease requests (e.g. lora_survey trying to
+        # join the same fanout 7s later) couldn't find a healthy
+        # dongle covering 915 MHz.
+        #
+        # active_lease_count includes this decoder's own lease (still
+        # held until finally: release below), so > 1 means there's at
+        # least one OTHER consumer holding a lease on this dongle.
+        other_leases_active = (
+            ctx.broker.active_lease_count(lease.dongle.id) > 1
+        )
         if (
             ctx.duration_s
             and run_elapsed < min(5.0, ctx.duration_s * 0.1)
             and result.decodes_emitted == 0
             and result.ended_reason not in decoder_specific_exits
+            and not other_leases_active
         ):
             log.warning(
                 "⚠ decoder %s on %s exited after only %.1fs (expected %.0fs); "
@@ -376,6 +520,27 @@ async def _run_decoder_on_band(
                 elapsed_s=run_elapsed,
                 remaining_s=max(0.0, ctx.duration_s - run_elapsed),
             ))
+        elif (
+            ctx.duration_s
+            and run_elapsed < min(5.0, ctx.duration_s * 0.1)
+            and result.decodes_emitted == 0
+            and other_leases_active
+        ):
+            # Early exit, but the dongle has other active leases — log
+            # the decoder-specific failure WITHOUT marking the dongle.
+            # The cohort knowing the dongle is fine prevents the
+            # cascade where every subsequent shared-lease allocation
+            # for this dongle fails.
+            log.warning(
+                "decoder %s on %s exited after only %.1fs (expected %.0fs) "
+                "but dongle %s has %d other active lease(s) — leaving "
+                "dongle healthy. This is typically a decoder-specific "
+                "issue (e.g. fanout disconnected this client for a "
+                "command conflict; check earlier WARNING lines).",
+                decoder.name, band.id, run_elapsed, ctx.duration_s,
+                lease.dongle.id,
+                ctx.broker.active_lease_count(lease.dongle.id) - 1,
+            )
 
         log.info(
             "decoder %s on %s emitted %d decodes",
@@ -386,6 +551,46 @@ async def _run_decoder_on_band(
         return result
     finally:
         await ctx.broker.release(lease)
+
+
+async def _run_lora_survey(band: BandConfig, ctx: StrategyContext):
+    """Run the continuous LoRa-survey sidecar on this band.
+
+    Acquires a shared lease on the band's dongle (joining the existing
+    fanout that rtl_433 / rtlamr are using), streams IQ continuously,
+    runs an energy-gated chirp-pattern detector. Bypasses the
+    rtl_power-based aggregator (which can't catch chirps because
+    rtl_power sweeps bins sequentially — see lora_survey_task.py).
+
+    Returns a `LoraSurveyStats` object that the strategy aggregator
+    treats as a non-decoder task: stats.errors are surfaced but
+    `decodes_emitted` is treated as 0 (LoRa detections are
+    DetectionEvents, not decoder output).
+    """
+    from rfcensus.engine.lora_survey_task import LoraSurveyTask
+
+    # v0.6.9: lora_survey joins the SAME shared slot the band's
+    # decoders use, so it must request the same rate they did. Without
+    # this, lora_survey would default to 2,400,000 Hz and (a) get
+    # refused if the band's actual slot is at 2,359,296 Hz for rtlamr
+    # compat, or (b) connect but interpret samples assuming the wrong
+    # clock rate, throwing off chirp duration math by ~1.7%.
+    band_rate = _band_shared_sample_rate(band, ctx)
+    task = LoraSurveyTask(
+        broker=ctx.broker,
+        event_bus=ctx.event_bus,
+        band=band,
+        duration_s=ctx.duration_s,
+        session_id=ctx.session_id,
+        sample_rate=band_rate,
+    )
+    try:
+        return await task.run()
+    except asyncio.CancelledError:
+        # Cancellation propagates from the wave-loop teardown; let
+        # the task's finally block release the lease.
+        await task.cancel()
+        raise
 
 
 async def _run_power_scan(band: BandConfig, ctx: StrategyContext):
@@ -501,6 +706,7 @@ async def _allocate_for_backend(
             prefer_driver=preferred_driver,
             prefer_wide_scan=backend_cls is HackRFSweepBackend,
             require_suitable_antenna=not ctx.all_bands,
+            band_id=band.id,
         ),
         consumer=f"{backend_cls.name}:{band.id}",
         timeout=5.0,

@@ -15,7 +15,7 @@ from rfcensus.spectrum.in_window_survey import (
     survey_iq_window,
 )
 
-from tests.unit.test_confirmation_task import _synthesize_lora_chirp
+from tests.unit._dsp_fixtures import _synthesize_lora_chirp
 
 
 SAMPLE_RATE = 2_400_000
@@ -176,3 +176,132 @@ class TestSurveyDoesNotCrash:
             capture_center_hz=CAPTURE_CENTER_HZ,
         )
         assert hits == []
+
+
+# ────────────────────────────────────────────────────────────────────
+# v0.6.8: end-to-end integration with realistic gap-free LoRa
+# ────────────────────────────────────────────────────────────────────
+
+
+class TestSurveyWithRealisticLora:
+    """The v0.6.5/0.6.6 survey was tested only against synthesize_lora_chirp
+    (chirps with 20% silent gaps), which doesn't match real LoRa packet
+    structure. This class verifies the v0.6.8 dechirp-classifier path
+    handles realistic gap-free LoRa correctly — the bug class that caused
+    SF9 (MediumFast) to be misclassified as SF7 (ShortFast) in real
+    captures."""
+
+    def _embed_realistic_lora_at_offset(
+        self, *, offset_hz: float, sf: int, bw: int, snr_db: float = 18,
+    ) -> np.ndarray:
+        """Build a 0.3 s 2.4 Msps capture containing a realistic LoRa
+        packet (preamble + many random data symbols, no gaps) at the
+        given offset from the capture center.
+
+        Packet length scales with SF: short SFs (7) need more chirps
+        for the averaged-PSD candidate finder to register the burst
+        above noise (low duty cycle otherwise). The dechirp classifier
+        itself works on much shorter signals — this is a survey-stage
+        threshold, not a classifier limitation.
+        """
+        from tests.unit._dsp_fixtures import synthesize_realistic_lora
+
+        # Aim for ~30% duty cycle. capture is 300 ms; chirp_dur = 2^SF/BW.
+        # n_chirps such that n_chirps * chirp_dur ≈ 90 ms.
+        chirp_dur_s = (2 ** sf) / bw
+        target_active_s = 0.09
+        n_chirps = max(40, int(target_active_s / chirp_dur_s))
+
+        rng = np.random.default_rng(7 + sf * 100 + bw)
+        data = rng.integers(0, 2 ** sf, size=n_chirps).tolist()
+        baseband = synthesize_realistic_lora(
+            sample_rate=SAMPLE_RATE, duration_s=DURATION_S,
+            bandwidth_hz=bw, sf=sf, snr_db=snr_db,
+            data_symbols=data, num_data_chirps=n_chirps,
+        )
+        # Mix to offset
+        n = baseband.size
+        t = np.arange(n, dtype=np.float64) / SAMPLE_RATE
+        mixer = np.exp(2j * np.pi * offset_hz * t).astype(np.complex64)
+        return (baseband * mixer).astype(np.complex64)
+
+    def test_meshtastic_medium_fast_classified_as_sf9(self):
+        """Direct regression for John's v0.6.7 misclassification:
+        MediumFast (SF9 / 250 kHz) traffic must produce a SurveyHit
+        with estimated_sf=9, not SF7."""
+        samples = self._embed_realistic_lora_at_offset(
+            offset_hz=400_000.0, sf=9, bw=250_000, snr_db=20,
+        )
+        hits = survey_iq_window(
+            samples,
+            sample_rate=SAMPLE_RATE,
+            capture_center_hz=CAPTURE_CENTER_HZ,
+        )
+        assert len(hits) >= 1, "expected to find the embedded SF9 packet"
+        # Find the hit closest to our embed location
+        target = CAPTURE_CENTER_HZ + 400_000
+        hit = min(hits, key=lambda h: abs(h.freq_hz - target))
+        assert hit.bandwidth_hz == 250_000, (
+            f"expected 250 kHz template; got {hit.bandwidth_hz}. "
+            f"All hit BWs: {[h.bandwidth_hz for h in hits]}"
+        )
+        assert hit.chirp_analysis.estimated_sf == 9, (
+            f"REGRESSION: Expected SF=9, got SF="
+            f"{hit.chirp_analysis.estimated_sf}. "
+            f"sf_scores={hit.chirp_analysis.sf_scores}"
+        )
+
+    def test_meshtastic_short_fast_classified_as_sf7(self):
+        """SF7 / 250 kHz (Meshtastic ShortFast) classifies correctly."""
+        samples = self._embed_realistic_lora_at_offset(
+            offset_hz=400_000.0, sf=7, bw=250_000, snr_db=20,
+        )
+        hits = survey_iq_window(
+            samples,
+            sample_rate=SAMPLE_RATE,
+            capture_center_hz=CAPTURE_CENTER_HZ,
+        )
+        assert len(hits) >= 1
+        target = CAPTURE_CENTER_HZ + 400_000
+        hit = min(hits, key=lambda h: abs(h.freq_hz - target))
+        assert hit.chirp_analysis.estimated_sf == 7
+
+    def test_meshtastic_long_fast_classified_as_sf11(self):
+        """SF11 / 250 kHz (Meshtastic LongFast — most common variant)
+        classifies correctly."""
+        samples = self._embed_realistic_lora_at_offset(
+            offset_hz=400_000.0, sf=11, bw=250_000, snr_db=20,
+        )
+        hits = survey_iq_window(
+            samples,
+            sample_rate=SAMPLE_RATE,
+            capture_center_hz=CAPTURE_CENTER_HZ,
+        )
+        assert len(hits) >= 1
+        target = CAPTURE_CENTER_HZ + 400_000
+        hit = min(hits, key=lambda h: abs(h.freq_hz - target))
+        assert hit.chirp_analysis.estimated_sf == 11
+
+    def test_hit_carries_dechirp_metadata(self):
+        """SurveyHit's chirp_analysis must include the dechirp
+        classifier outputs so downstream consumers (LoraSurveyTask
+        emission, report renderer) can use them."""
+        samples = self._embed_realistic_lora_at_offset(
+            offset_hz=400_000.0, sf=9, bw=250_000, snr_db=20,
+        )
+        hits = survey_iq_window(
+            samples,
+            sample_rate=SAMPLE_RATE,
+            capture_center_hz=CAPTURE_CENTER_HZ,
+        )
+        assert len(hits) >= 1
+        hit = min(
+            hits, key=lambda h: abs(h.freq_hz - (CAPTURE_CENTER_HZ + 400_000)),
+        )
+        a = hit.chirp_analysis
+        assert a.estimated_sf is not None
+        assert a.sf_confidence > 1.0
+        assert a.sf_peak_concentration > 0.0
+        assert a.sf_scores is not None
+        assert len(a.sf_scores) == 6  # SF7 through SF12
+

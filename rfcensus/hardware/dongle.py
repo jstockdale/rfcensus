@@ -74,6 +74,17 @@ class Dongle:
     health_notes: list[str] = field(default_factory=list)
     # Driver-specific handles, e.g. the device index rtl_433 / rtl_power expect
     driver_index: int | None = None
+    # v0.6.0: when set, this dongle is pinned to a long-running consumer
+    # for the entire session. Purely informational — the actual exclusion
+    # from the scheduler happens via the broker's exclusive-lease tracking
+    # (lease puts the dongle in BUSY status, scheduler's `usable()` check
+    # naturally skips BUSY). This field exists so the UI / list output /
+    # session attach record can show "pinned to rtl_433@433.92" without
+    # having to cross-reference broker state.
+    #
+    # Format: "<consumer>" — typically the same string passed as the
+    # broker.allocate(consumer=...) argument (e.g. "pin:rtl_433@433.92M").
+    pin_holder: str | None = None
 
     def covers(self, freq_hz: int) -> bool:
         low, high = self.capabilities.freq_range_hz

@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
-from rfcensus.detectors.builtin.lora import LoraDetector
 from rfcensus.detectors.builtin.p25 import P25Detector
 from rfcensus.detectors.builtin.wifi_bt import WifiBtDetector
 from rfcensus.events import ActiveChannelEvent, DetectionEvent, EventBus
@@ -31,102 +30,6 @@ def _make_active_channel(
         classification=classification,
         confidence=0.7,
     )
-
-
-@pytest.mark.asyncio
-class TestLoraDetector:
-    async def test_fires_on_three_qualifying_bursts(self):
-        bus = EventBus()
-        captured: list[DetectionEvent] = []
-
-        async def capture(e: DetectionEvent) -> None:
-            captured.append(e)
-
-        bus.subscribe(DetectionEvent, capture)
-        det = LoraDetector()
-        det.attach(bus, session_id=1, iq_service=None)
-
-        for _ in range(3):
-            await bus.publish(_make_active_channel(
-                freq_hz=915_200_000, bandwidth_hz=125_000,
-                classification="pulsed",
-            ))
-        await bus.drain(timeout=2.0)
-
-        assert len(captured) == 1
-        assert captured[0].technology == "lora"
-        assert captured[0].detector_name == "lora"
-        # LoRaWAN needs 3 distinct channels, not just 3 bursts on one channel
-        assert captured[0].technology == "lora"
-
-    async def test_fires_lorawan_on_multi_channel_gateway(self):
-        """If we see 3 distinct channels before the first announcement,
-        it's a LoRaWAN gateway. This requires the 3rd burst on channel A to
-        arrive AFTER we've also seen at least 3 distinct channels."""
-        bus = EventBus()
-        captured: list[DetectionEvent] = []
-
-        async def capture(e: DetectionEvent) -> None:
-            captured.append(e)
-
-        bus.subscribe(DetectionEvent, capture)
-        det = LoraDetector()
-        det.attach(bus, session_id=1, iq_service=None)
-
-        # Interleave 3 channels so all three are seen before announcement
-        freqs = (915_200_000, 915_400_000, 915_600_000)
-        for _round in range(3):
-            for f in freqs:
-                await bus.publish(_make_active_channel(f, 125_000))
-        await bus.drain(timeout=2.0)
-
-        assert len(captured) >= 1
-        # At announcement time, we've seen 3 distinct channels → LoRaWAN
-        assert captured[0].technology == "lorawan"
-
-    async def test_ignores_wrong_bandwidth(self):
-        bus = EventBus()
-        captured: list[DetectionEvent] = []
-        bus.subscribe(DetectionEvent, lambda e: captured.append(e))  # type: ignore[arg-type,misc]
-
-        det = LoraDetector()
-        det.attach(bus, session_id=1, iq_service=None)
-
-        # 50 kHz bandwidth doesn't match LoRa signatures
-        for _ in range(5):
-            await bus.publish(_make_active_channel(915_200_000, 50_000))
-        await bus.drain(timeout=1.0)
-        assert captured == []
-
-    async def test_ignores_out_of_band(self):
-        bus = EventBus()
-        captured: list[DetectionEvent] = []
-        bus.subscribe(DetectionEvent, lambda e: captured.append(e))  # type: ignore[arg-type,misc]
-
-        det = LoraDetector()
-        det.attach(bus, session_id=1, iq_service=None)
-
-        # 2.4 GHz isn't a LoRa band
-        for _ in range(5):
-            await bus.publish(_make_active_channel(2_450_000_000, 125_000))
-        await bus.drain(timeout=1.0)
-        assert captured == []
-
-    async def test_ignores_continuous_carrier(self):
-        """Continuous carriers aren't LoRa (LoRa is bursty)."""
-        bus = EventBus()
-        captured: list[DetectionEvent] = []
-        bus.subscribe(DetectionEvent, lambda e: captured.append(e))  # type: ignore[arg-type,misc]
-
-        det = LoraDetector()
-        det.attach(bus, session_id=1, iq_service=None)
-
-        for _ in range(5):
-            await bus.publish(_make_active_channel(
-                915_200_000, 125_000, classification="continuous_carrier",
-            ))
-        await bus.drain(timeout=1.0)
-        assert captured == []
 
 
 @pytest.mark.asyncio
@@ -164,6 +67,143 @@ class TestP25Detector:
         assert len(captured) >= 1
         # Should be trunked since ≥3 channels on a shared band (VHF)
         assert captured[0].technology == "p25_trunked_system"
+
+    # ──────────────────────────────────────────────────────────────
+    # v0.6.2 — accept intermittent + pulsed classifications.
+    #
+    # The pre-v0.6.2 filter required active_ratio > 0.9 classifications
+    # (continuous_carrier / modulated_continuous / fm_voice). P25 voice
+    # channels keyed on/off, and even control channels with bin-level
+    # power variability, land in `intermittent` or `pulsed`. Result:
+    # the user's east-bay simulcast P25 system at ~770 MHz had 753
+    # active carriers visible but the detector NEVER fired because all
+    # of them were classified `intermittent`.
+    # ──────────────────────────────────────────────────────────────
+
+    async def test_v062_fires_on_intermittent_in_dedicated_band(self):
+        """Single intermittent narrowband carrier in 700 MHz public
+        safety band → fires (was silently ignored pre-v0.6.2)."""
+        bus = EventBus()
+        captured: list[DetectionEvent] = []
+        bus.subscribe(DetectionEvent, lambda e: captured.append(e))  # type: ignore[arg-type,misc]
+
+        det = P25Detector()
+        det.attach(bus, session_id=1)
+
+        # 770.023 MHz — synthesizes the user's east-bay reported
+        # control-channel candidate (strongest carrier in their
+        # mystery-list at this freq).
+        await bus.publish(_make_active_channel(
+            770_023_000, 12_500, classification="intermittent",
+        ))
+        await bus.drain(timeout=1.0)
+        assert len(captured) == 1
+        assert captured[0].technology == "p25_narrowband"
+        assert captured[0].freq_hz == 770_023_000
+
+    async def test_v062_fires_on_pulsed_in_dedicated_band(self):
+        """Pulsed (rare-burst) narrowband carrier in 800 MHz public
+        safety also fires now."""
+        bus = EventBus()
+        captured: list[DetectionEvent] = []
+        bus.subscribe(DetectionEvent, lambda e: captured.append(e))  # type: ignore[arg-type,misc]
+
+        det = P25Detector()
+        det.attach(bus, session_id=1)
+
+        await bus.publish(_make_active_channel(
+            857_692_000, 12_500, classification="pulsed",
+        ))
+        await bus.drain(timeout=1.0)
+        assert len(captured) == 1
+        assert captured[0].technology == "p25_narrowband"
+
+    async def test_v062_fires_trunked_with_intermittent_channels(self):
+        """Three intermittent 12.5 kHz channels in a non-dedicated
+        public-safety band → trunked detection still fires."""
+        bus = EventBus()
+        captured: list[DetectionEvent] = []
+        bus.subscribe(DetectionEvent, lambda e: captured.append(e))  # type: ignore[arg-type,misc]
+
+        det = P25Detector()
+        det.attach(bus, session_id=1)
+
+        # VHF (non-dedicated) — needs ≥3 channels for trunked detection
+        for freq in (155_000_000, 155_012_500, 155_025_000):
+            await bus.publish(_make_active_channel(
+                freq, 12_500, classification="intermittent",
+            ))
+        await bus.drain(timeout=1.0)
+        assert len(captured) >= 1
+        assert captured[0].technology == "p25_trunked_system"
+
+    async def test_v062_still_rejects_unrelated_classifications(self):
+        """Loosening to intermittent + pulsed must NOT also let in
+        `unknown` or `periodic` — those don't fit the P25 fingerprint
+        (control/voice channels aren't periodic, and `unknown` means
+        the classifier had insufficient evidence)."""
+        bus = EventBus()
+        captured: list[DetectionEvent] = []
+        bus.subscribe(DetectionEvent, lambda e: captured.append(e))  # type: ignore[arg-type,misc]
+
+        det = P25Detector()
+        det.attach(bus, session_id=1)
+
+        # Even at the right freq + bandwidth, these classifications
+        # shouldn't fire.
+        await bus.publish(_make_active_channel(
+            770_000_000, 12_500, classification="periodic",
+        ))
+        await bus.publish(_make_active_channel(
+            770_500_000, 12_500, classification="unknown",
+        ))
+        await bus.drain(timeout=1.0)
+        assert captured == []
+
+    async def test_v062_simulcast_multiple_strong_carriers_fire(self):
+        """Synthesize the user's east-bay simulcast pattern: multiple
+        strong carriers around 770 MHz. The dedicated-band fast-path
+        means we fire on the FIRST matching carrier and dedup the
+        band thereafter (one detection per band is intentional — see
+        _announced set). Pre-v0.6.2, this silently fired zero times
+        because none of these carriers were `continuous_carrier`.
+
+        The detector accumulates all matching carriers in
+        `_continuous_channels[band]` even after the announce, which
+        could feed a future "update detection with more evidence"
+        pathway. For now we just verify the announce happened and that
+        downstream observers (the report) can see all four carriers
+        had been observed."""
+        bus = EventBus()
+        captured: list[DetectionEvent] = []
+        bus.subscribe(DetectionEvent, lambda e: captured.append(e))  # type: ignore[arg-type,misc]
+
+        det = P25Detector()
+        det.attach(bus, session_id=1)
+
+        # The user's reported strongest carriers in p25_700_public_safety
+        carriers = (770_023_000, 770_295_000, 770_305_000, 770_858_000)
+        for freq in carriers:
+            await bus.publish(_make_active_channel(
+                freq, 12_500, classification="intermittent",
+            ))
+        await bus.drain(timeout=1.0)
+
+        # Exactly one detection in the 769-775 MHz band — the band is
+        # `_announced` after the first matching carrier so subsequent
+        # carriers don't re-fire.
+        band_700_detections = [
+            d for d in captured
+            if 769_000_000 <= d.metadata.get("band_low_hz", 0) < 776_000_000
+        ]
+        assert len(band_700_detections) == 1
+        # Detection fired on the first carrier we sent
+        assert band_700_detections[0].freq_hz == 770_023_000
+        # All four carriers are accumulated in the detector's internal
+        # state regardless of announce dedup — this is the data a
+        # future "evidence updater" would surface to the report.
+        band = (769_000_000, 775_000_000)
+        assert det._continuous_channels[band] == set(carriers)
 
 
 @pytest.mark.asyncio

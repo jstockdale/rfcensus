@@ -85,6 +85,13 @@ suggested_decoders = ["rtlamr", "rtl_433"]
 strategy = "decoder_primary"
 power_scan_parallel = true
 typical_activity = "constant"
+# v0.6.5: enable LoRa survey sidecar. The shared 915 ISM fanout
+# already produces continuous IQ at 2.4 Msps for rtl_433 and rtlamr;
+# we tap it periodically (every 30s) to run chirp-pattern analysis
+# on a 250ms window. This is the only path that actually catches
+# LoRa/Meshtastic — the rtl_power-based aggregator can't capture
+# multi-bin simultaneity that chirps require.
+lora_survey = true
 # Default heuristic would give 101 kHz bins — too coarse for SCM
 # meters (~75 kHz BW), Z-Wave (40-200 kHz), or LoRa (125 kHz).
 # 25 kHz bins resolve all but the narrowest features and give a

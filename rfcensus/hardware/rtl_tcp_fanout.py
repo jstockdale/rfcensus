@@ -55,9 +55,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from rfcensus.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from rfcensus.events import EventBus
 
 log = get_logger(__name__)
 
@@ -68,16 +71,18 @@ log = get_logger(__name__)
 _RELAY_CHUNK_SIZE = 16 * 1024
 
 # Per-client bounded queue depth. At 2.4 Msps × 2 bytes = 4.8 MB/s,
-# 256 chunks × 16 KB = 4 MB represents ~800 ms of IQ. This absorbs
+# 512 chunks × 16 KB = 8 MB represents ~1.7s of IQ. This absorbs
 # jitter from CPU-heavy decoders (rtlamr's preamble search burns
-# measurable CPU) without spurious drops. A client that still falls
-# behind at 800ms of headroom has a real problem — typically either
-# a rate mismatch (rtlamr expects 2.36 Msps but rtl_tcp may still be
-# serving 2.4 Msps, so kernel-side pipe accumulates ~1.7% per second
-# monotonically) or the machine is under-resourced for the workload.
-# Previous value 32 (~100ms) was too aggressive and caused spurious
-# drops for rtlamr in v0.5.25.
-_CLIENT_QUEUE_DEPTH = 256
+# measurable CPU) without spurious drops, even when 3 high-rate
+# clients (rtl_433 + rtlamr + lora_survey) share one fanout. A client
+# that still falls behind at 1.7s of headroom has a real problem —
+# typically either a rate mismatch (rtlamr expects 2.36 Msps but
+# rtl_tcp may still be serving 2.4 Msps, so kernel-side pipe
+# accumulates ~1.7% per second monotonically) or the machine is
+# under-resourced for the workload. Bumped from 256 to 512 in v0.6.6
+# after multi-client stress on a Pi 5 showed periodic queue fills
+# coinciding with lora_survey's 64KB readexactly cycles.
+_CLIENT_QUEUE_DEPTH = 512
 
 # rtl_tcp header: 4-byte magic + 4-byte tuner type + 4-byte gain count
 _RTL_TCP_HEADER_SIZE = 12
@@ -131,6 +136,9 @@ class _DownstreamClient:
     dropped_chunks: int = 0
     bytes_sent: int = 0
     commands_forwarded: int = 0
+    # v0.6.8: shared-mode command filtering diagnostics.
+    commands_dropped_redundant: int = 0  # exact match → no upstream write
+    commands_rejected_conflict: int = 0  # mismatch → client disconnected
     disconnected: bool = False
 
 
@@ -155,12 +163,45 @@ class RtlTcpFanout:
         downstream_host: str = "127.0.0.1",
         downstream_port: int = 0,  # 0 = OS-assigned
         slot_label: str = "fanout",
+        event_bus: Optional["EventBus"] = None,
+        # v0.6.8: shared-mode command filtering. The upstream rtl_tcp
+        # was started by the broker with these parameters; clients
+        # that try to change them would corrupt the stream for every
+        # OTHER client. Setting these locks the fanout into "shared
+        # filter mode": exact-match retune commands are silently
+        # acknowledged (no upstream write — already at that value);
+        # mismatching retune commands cause the offending client to
+        # be disconnected so it fails loudly rather than getting wrong
+        # data. Pass None for both to disable filtering (legacy
+        # passthrough behavior, suitable for exclusive single-client
+        # tests but never the broker's runtime path).
+        upstream_sample_rate: Optional[int] = None,
+        upstream_center_freq_hz: Optional[int] = None,
     ) -> None:
         self._upstream_host = upstream_host
         self._upstream_port = upstream_port
         self._downstream_host = downstream_host
         self._downstream_port = downstream_port
         self._slot_label = slot_label
+        # v0.6.4: optional event bus for FanoutClientEvent publishing.
+        # When None, the fanout works exactly as before (no events
+        # published). The broker passes its bus when constructing
+        # fanouts at runtime; tests that don't care about events
+        # leave it None.
+        self._event_bus = event_bus
+
+        # v0.6.8: locked upstream parameters for command filtering.
+        self._upstream_sample_rate = upstream_sample_rate
+        self._upstream_center_freq_hz = upstream_center_freq_hz
+
+        # v0.6.5: paused-writes flag. When True, the relay loop drops
+        # incoming chunks instead of distributing them to downstream
+        # client queues. Decoders block on their queue.get() until the
+        # flag clears. Toggled via pause_writes() / resume_writes().
+        self._writes_paused: bool = False
+        # Counter for diagnostics — how many chunks were dropped
+        # while paused, since last resume.
+        self._paused_drops: int = 0
 
         # Populated by start()
         self._upstream_reader: Optional[asyncio.StreamReader] = None
@@ -170,6 +211,13 @@ class RtlTcpFanout:
         self._relay_task: Optional[asyncio.Task] = None
         self._clients: list[_DownstreamClient] = []
         self._stopped = False
+        # v0.6.6: detached fire-and-forget tasks (currently just slow-
+        # client event publishes from the relay loop). Holding strong
+        # refs prevents Python from GC'ing pending tasks and emitting
+        # the "Task was destroyed but it is pending!" warning. The
+        # done-callback drops each task on completion so the set
+        # doesn't grow without bound.
+        self._bg_tasks: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------
     # Public API
@@ -192,6 +240,129 @@ class RtlTcpFanout:
     def client_count(self) -> int:
         """How many clients are currently connected (not disconnected)."""
         return sum(1 for c in self._clients if not c.disconnected)
+
+    @property
+    def writes_paused(self) -> bool:
+        """True if pause_writes() was called and resume_writes() hasn't
+        been called yet. Used by the TUI dashboard to show paused state
+        and by the wave loop's quick-pause check."""
+        return self._writes_paused
+
+    @property
+    def paused_drops(self) -> int:
+        """Count of chunks dropped while paused since last resume.
+        Reset to 0 on resume_writes(). Useful for diagnostics — a high
+        drop count over a long pause confirms upstream IQ kept flowing
+        (so resume should be quick)."""
+        return self._paused_drops
+
+    def pause_writes(self) -> None:
+        """v0.6.5 quick-pause primitive: stop distributing IQ chunks
+        from upstream to downstream client queues.
+
+        Effect: the relay loop continues reading from rtl_tcp upstream
+        (so the dongle keeps producing samples and the TCP buffer
+        doesn't back up), but each chunk is dropped instead of being
+        queued for clients. Decoder processes connected to downstream
+        ports block on their socket read with no data flowing —
+        natural pause without killing them.
+
+        Idempotent: calling twice is fine.
+
+        Pairs with `resume_writes()`. The session-level pause/resume
+        coordinator (SessionControl) calls these via the broker.
+        """
+        if not self._writes_paused:
+            log.info("[%s] pausing writes (decoders will block)", self._slot_label)
+            self._writes_paused = True
+            self._paused_drops = 0
+
+    def resume_writes(self) -> bool:
+        """v0.6.5 quick-pause primitive: resume distributing IQ chunks.
+
+        Returns True if all downstream clients are still connected
+        and ready to receive (the happy quick-pause case). Returns
+        False if any client died during the pause — the caller should
+        then trigger the deep-pause restart path for this slot.
+
+        We can't actually probe a TCP socket for liveness without
+        sending data, but the relay's per-client state already
+        records `disconnected` flags set by the writer task when its
+        socket write fails. Checking those is enough: a decoder that
+        died during pause will have either gracefully closed (which
+        the writer task notices on its next attempt — but writer is
+        blocked on queue.get() during pause, so it won't notice) or
+        the kernel will deliver a RST that we'd see on the next write.
+        Therefore we do an explicit zero-byte write probe per client.
+        """
+        if not self._writes_paused:
+            return True
+
+        all_alive = True
+        for client in self._clients:
+            if client.disconnected:
+                continue
+            try:
+                # Zero-byte write doesn't send anything visible to
+                # the peer but does exercise the socket. If the
+                # peer has gone away, this raises BrokenPipeError
+                # or similar.
+                client.writer.write(b"")
+                # No drain — that would block on a slow peer. We're
+                # only checking for an immediate error.
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                client.disconnected = True
+                all_alive = False
+                log.warning(
+                    "[%s] client %s died during pause — will need "
+                    "restart on resume",
+                    self._slot_label, client.label,
+                )
+
+        log.info(
+            "[%s] resuming writes (dropped %d chunk(s) during pause, "
+            "%s)",
+            self._slot_label, self._paused_drops,
+            "all clients alive" if all_alive else "some clients dead",
+        )
+        self._writes_paused = False
+        self._paused_drops = 0
+        return all_alive
+
+    def disconnect_all_clients(self) -> int:
+        """v0.6.5 deep-pause primitive: close every downstream client
+        connection, forcing decoders to exit on socket EOF.
+
+        The fanout itself stays alive — listening socket open, upstream
+        rtl_tcp connection open, internal state preserved. New clients
+        could connect afterward (none will, in practice, because this
+        is called as part of deep-pause and the strategy tasks owning
+        the dead decoders will just exit). On user resume the wave
+        loop's normal restart path re-allocates and re-launches.
+
+        Returns the number of clients disconnected. Idempotent in the
+        sense that already-disconnected clients are skipped.
+        """
+        n = 0
+        for client in self._clients:
+            if client.disconnected:
+                continue
+            client.disconnected = True
+            n += 1
+            with contextlib.suppress(Exception):
+                client.writer.close()
+            with contextlib.suppress(asyncio.QueueFull):
+                # Wake-up sentinel so the writer task exits its
+                # blocked queue.get() and the per-client handler
+                # finishes its disconnect cleanup.
+                client.queue.put_nowait(b"")
+        if n > 0:
+            log.info(
+                "[%s] disconnected %d downstream client(s) for deep-pause "
+                "teardown (upstream + listener stay alive)",
+                self._slot_label, n,
+            )
+        return n
 
     async def start(self) -> None:
         """Connect upstream, cache the 12-byte header, bind listener.
@@ -308,6 +479,20 @@ class RtlTcpFanout:
         # Close upstream
         await self._close_upstream_quietly()
 
+        # v0.6.6: drain any in-flight slow-client event tasks. They're
+        # short and we already cancelled the relay loop, so this is
+        # quick — but do it before we report the stopped log so the
+        # event order in the dashboard is consistent.
+        if self._bg_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._bg_tasks, return_exceptions=True),
+                    timeout=1.0,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                for t in self._bg_tasks:
+                    t.cancel()
+
         dropped_total = sum(c.dropped_chunks for c in self._clients)
         log.info(
             "[%s] fanout stopped (clients served: %d, "
@@ -326,6 +511,29 @@ class RtlTcpFanout:
         exit (any path), closes all client writers so downstream
         decoders see EOF cleanly rather than hanging on a silent
         socket.
+
+        v0.6.6 hot-path performance:
+
+          • The per-client distribution loop is fully synchronous —
+            no awaits between clients. Awaits in this loop would let
+            other tasks run mid-distribution, allowing one client's
+            writer to fall behind another's. With multiple high-rate
+            decoders (rtl_433 + rtlamr + lora_survey all at 4.5 MB/s
+            on the same fanout), a single misplaced await can cascade
+            into queue overflows that look like network problems.
+
+          • Slow-client warning publish is fire-and-forget via
+            asyncio.create_task. The previous `await
+            self._publish_client_event` was the worst offender — even
+            though bus.publish doesn't wait for handlers, it still
+            yields the loop, which in a hot 3-client distribution
+            became a stall vector.
+
+          • Drop-oldest on full queue is a last-ditch measure. With a
+            512-deep queue (was 256 in v0.6.5) at 16 KB chunks per
+            slot we have ~8 MB / ~1.7s of buffering per client,
+            enough slack for routine scheduler jitter without
+            drops.
         """
         assert self._upstream_reader is not None
         try:
@@ -345,14 +553,30 @@ class RtlTcpFanout:
                         self._slot_label,
                     )
                     break
-                # Distribute to each active client. Drop-oldest on a
-                # full queue so slow clients don't stall fast ones.
+                # v0.6.5: if quick-pause is active, drop the chunk
+                # without distributing. Decoders block on their
+                # queue.get() — natural pause. We continue reading
+                # upstream so the dongle's TCP buffer doesn't back up
+                # (which would manifest as a fanout slowdown later
+                # rather than instantly resuming).
+                if self._writes_paused:
+                    self._paused_drops += 1
+                    continue
+                # Distribute to each active client. SYNCHRONOUS LOOP —
+                # no awaits. See docstring for why.
                 for client in self._clients:
                     if client.disconnected:
                         continue
                     try:
                         client.queue.put_nowait(chunk)
                     except asyncio.QueueFull:
+                        # Drop oldest, then put. The two suppress
+                        # blocks handle the impossible-but-defensive
+                        # case where another coroutine drained the
+                        # queue between our get_nowait and put_nowait
+                        # (can't actually happen since we never await
+                        # in this loop, but leaving the guards costs
+                        # nothing and simplifies reasoning).
                         with contextlib.suppress(asyncio.QueueEmpty):
                             client.queue.get_nowait()
                         with contextlib.suppress(asyncio.QueueFull):
@@ -365,6 +589,16 @@ class RtlTcpFanout:
                                 "[%s] client %s slow — dropped %d chunks",
                                 self._slot_label, client.label,
                                 client.dropped_chunks,
+                            )
+                            # v0.6.6: fire-and-forget. The previous
+                            # `await self._publish_client_event(...)`
+                            # blocked the relay until subscribers
+                            # processed the event. With multiple
+                            # high-rate clients this manifested as
+                            # cascading queue fills.
+                            self._spawn_client_event(
+                                client.label, "slow",
+                                bytes_sent=client.bytes_sent,
                             )
         except asyncio.CancelledError:
             pass
@@ -390,6 +624,73 @@ class RtlTcpFanout:
     # ------------------------------------------------------------
     # Internal: per-client connection handling
     # ------------------------------------------------------------
+
+    async def _publish_client_event(
+        self,
+        peer_addr: str,
+        event_type: str,
+        bytes_sent: int = 0,
+    ) -> None:
+        """Publish a FanoutClientEvent if a bus is configured.
+
+        No-op when `_event_bus is None` (the default for tests and
+        any caller that doesn't care about the dashboard). Awaits the
+        bus.publish call, which itself dispatches handlers as
+        background tasks — but the await still yields the event loop,
+        so do NOT call this from the hot relay loop. Use
+        `_spawn_client_event` instead.
+        """
+        if self._event_bus is None:
+            return
+        # Local import keeps the bus import out of the runtime path
+        # for fanouts that never publish.
+        from rfcensus.events import FanoutClientEvent
+        try:
+            await self._event_bus.publish(
+                FanoutClientEvent(
+                    slot_id=self._slot_label,
+                    peer_addr=peer_addr,
+                    event_type=event_type,  # type: ignore[arg-type]
+                    bytes_sent=bytes_sent,
+                )
+            )
+        except Exception:
+            # Never let bus issues kill the fanout. Log and continue.
+            log.exception(
+                "[%s] failed to publish FanoutClientEvent",
+                self._slot_label,
+            )
+
+    def _spawn_client_event(
+        self,
+        peer_addr: str,
+        event_type: str,
+        bytes_sent: int = 0,
+    ) -> None:
+        """v0.6.6: fire-and-forget variant for the hot relay loop.
+
+        Schedules the publish as a detached task so the relay loop
+        never yields waiting for subscribers. We track the task in
+        an internal set with a done-callback to avoid the asyncio
+        warning about un-awaited tasks; Python would otherwise GC
+        the Task while it's pending and emit a noisy log line.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            task = asyncio.create_task(
+                self._publish_client_event(
+                    peer_addr, event_type, bytes_sent=bytes_sent,
+                ),
+                name=f"fanout-event[{self._slot_label}]",
+            )
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
+        except Exception:
+            # If the event loop isn't running for some reason, fall
+            # back silently. The fanout's job is moving bytes, not
+            # publishing telemetry.
+            pass
 
     async def _handle_client(
         self,
@@ -419,6 +720,9 @@ class RtlTcpFanout:
             "[%s] client connected from %s (now %d client(s))",
             self._slot_label, peer_str, self.client_count,
         )
+        # v0.6.4: announce the new client so the TUI can show fanout
+        # activity in the dongle detail view.
+        await self._publish_client_event(peer_str, "connect")
 
         # Track how long this client was connected and which subtask
         # ended first — critical for diagnosing fast-exit bugs like
@@ -487,11 +791,20 @@ class RtlTcpFanout:
             level(
                 "[%s] client %s disconnected after %.2fs "
                 "(sent=%d bytes, dropped=%d chunks, cmds_fwd=%d, "
+                "cmds_absorbed=%d, cmds_rejected=%d, "
                 "ended_by=%s; %d client(s) remain)",
                 self._slot_label, peer_str, duration_s,
                 client.bytes_sent, client.dropped_chunks,
-                client.commands_forwarded, ended_by,
-                self.client_count,
+                client.commands_forwarded,
+                client.commands_dropped_redundant,
+                client.commands_rejected_conflict,
+                ended_by, self.client_count,
+            )
+            # v0.6.4: announce disconnect for the dashboard. bytes_sent
+            # carries the lifetime byte count for this client so the
+            # TUI can show "rtlamr disconnected after 12 MB delivered."
+            await self._publish_client_event(
+                peer_str, "disconnect", bytes_sent=client.bytes_sent,
             )
 
     async def _client_writer(self, client: _DownstreamClient) -> None:
@@ -528,11 +841,61 @@ class RtlTcpFanout:
         client: _DownstreamClient,
         reader: asyncio.StreamReader,
     ) -> None:
-        """Read 5-byte rtl_tcp commands from this client, forward
-        upstream. Exits when the client disconnects or upstream is
-        torn down.
+        """Read 5-byte rtl_tcp commands from this client; in shared
+        mode (when the broker locked the upstream tuning), filter
+        them so one client can't corrupt the stream for the others.
+
+        v0.6.8 — shared-mode filtering rules:
+          • set_freq / set_sample_rate matching the locked upstream
+            value: silently absorbed (no upstream write). The client's
+            internal state model thinks the command succeeded — fine,
+            we ARE at that value.
+          • set_freq / set_sample_rate NOT matching the lock: the
+            client is asking us to retune the shared dongle, which
+            would break every other client. We disconnect this client
+            so it sees the EOF and (typically) exits with a clear
+            error rather than silently receiving wrong-band data.
+          • Every other command (gain, AGC, freq correction, etc.):
+            forwarded as-is. These don't change the per-client view of
+            the stream in incompatible ways — gain in particular is
+            a tuner-wide setting and the broker already picked one.
+            Forwarding them is the conservative choice (gain may need
+            adjustment for sensitivity), but a future revision could
+            also decide to lock these.
+
+        Design note — "why filter rather than just drop everything?":
+        we know the upstream parameters from the broker, so we COULD
+        drop every tuning command from clients. The argument against:
+        if a client requests a value that DIFFERS from the lock (rare,
+        but the rtlamr 2,359,296 Hz quirk is real), drop-all silently
+        gives them wrong-rate data — their demodulator runs with the
+        wrong assumed clock and produces subtly broken decodes with no
+        log line, no error, no clue. Disconnecting that client instead
+        fails LOUDLY: the operator sees a WARNING explaining exactly
+        what happened, and the conflicting consumer either gets
+        reconfigured or the band gets reassigned. Loud failure beats
+        silent wrong-data every time. Same-value commands ARE just
+        absorbed though, so the common case has zero downside.
+
+        Design note — "should we also lock gain / AGC / etc.?":
+        currently the broker only sets sample_rate + center_freq at
+        rtl_tcp launch (-s and -f); gain stays at rtl_tcp's default
+        (AGC enabled). So clients' gain commands are the ONLY way
+        gain ever gets set per-band. Once the broker grows a way to
+        configure per-band gain and pass it through here, those
+        commands could be filtered the same way. For now leaving them
+        passthrough is the right tradeoff — last-writer-wins gain
+        conflicts are rare in practice and easy to live with.
+
+        When upstream parameters weren't passed in (legacy/test path),
+        skip filtering entirely — every command is forwarded as before.
         """
         import struct
+
+        filtering_enabled = (
+            self._upstream_sample_rate is not None
+            or self._upstream_center_freq_hz is not None
+        )
 
         while not client.disconnected:
             try:
@@ -545,6 +908,62 @@ class RtlTcpFanout:
                     self._slot_label, client.label, e,
                 )
                 return
+
+            cmd_id = cmd[0]
+            cmd_value = struct.unpack(">I", cmd[1:5])[0]
+            cmd_name = _CMD_NAMES.get(cmd_id, f"cmd_{cmd_id:#04x}")
+
+            # v0.6.8: shared-mode tuning filter.
+            if filtering_enabled and cmd_id in (0x01, 0x02):
+                # 0x01 = set_freq, 0x02 = set_sample_rate
+                locked_value = (
+                    self._upstream_center_freq_hz if cmd_id == 0x01
+                    else self._upstream_sample_rate
+                )
+                if locked_value is None:
+                    # Only one of the two is locked; this command's
+                    # parameter isn't. Treat as legacy passthrough.
+                    pass
+                elif cmd_value == locked_value:
+                    # Idempotent: the client wants what we've already
+                    # got. Absorb it — no upstream write. Logged at
+                    # DEBUG to keep the normal log clean; an upstream
+                    # write would have logged INFO.
+                    client.commands_dropped_redundant += 1
+                    log.debug(
+                        "[%s] %s → %s(%d) absorbed "
+                        "(matches locked upstream value)",
+                        self._slot_label, client.label,
+                        cmd_name, cmd_value,
+                    )
+                    continue
+                else:
+                    # Conflict: client is asking us to retune in a way
+                    # that would break the other clients. Disconnect
+                    # this client so it fails loudly. The fanout
+                    # cleanup loop will mark it disconnected and the
+                    # relay loop will skip it; the client's process
+                    # typically exits cleanly when its rtl_tcp socket
+                    # closes.
+                    client.commands_rejected_conflict += 1
+                    log.warning(
+                        "[%s] %s requested %s(%d) but upstream is "
+                        "locked at %d — disconnecting client to "
+                        "prevent stream corruption for other clients. "
+                        "If this is unexpected, check the consumer's "
+                        "configured sample_rate/freq matches the "
+                        "shared slot's.",
+                        self._slot_label, client.label,
+                        cmd_name, cmd_value, locked_value,
+                    )
+                    # Mark disconnected; the writer pump task will
+                    # close the socket and the relay loop will skip.
+                    client.disconnected = True
+                    try:
+                        client.writer.close()
+                    except Exception:
+                        pass
+                    return
 
             if self._upstream_writer is None:
                 return
@@ -565,9 +984,6 @@ class RtlTcpFanout:
             # set_freq at INFO — those are the commands that meaningfully
             # change the shared stream and often explain cross-client
             # compatibility surprises (e.g. rtlamr's 2392064 Hz quirk).
-            cmd_id = cmd[0]
-            cmd_name = _CMD_NAMES.get(cmd_id, f"cmd_{cmd_id:#04x}")
-            cmd_value = struct.unpack(">I", cmd[1:5])[0]
             if cmd_id in (0x01, 0x02):
                 log.info(
                     "[%s] %s → upstream: %s(%d)",

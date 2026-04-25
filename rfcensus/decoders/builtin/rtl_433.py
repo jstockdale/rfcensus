@@ -126,7 +126,12 @@ class Rtl433Decoder(DecoderBase):
                 name=f"rtl_433[{lease.dongle.id}@{freq_hz}]",
                 args=args,
                 log_stderr=True,
-                stderr_log_level="DEBUG",
+                # v0.6.7: rtl_433 stderr at INFO so unexpected exits
+                # (which we observed as 74-122s early-exits when -T 720
+                # was set) are visible in the user's normal log. The
+                # decoder's own messages are valuable signal — buffer
+                # overflow warnings, "rtl_tcp closed" notices, etc.
+                stderr_log_level="INFO",
             )
         )
         try:
@@ -156,7 +161,23 @@ class Rtl433Decoder(DecoderBase):
                     await spec.event_bus.publish(event)
                     result.decodes_emitted += 1
         finally:
-            await proc.stop()
+            # v0.6.7: capture the actual exit code so the strategy
+            # layer can distinguish "rtl_433 exited cleanly because
+            # -T expired" from "rtl_433 crashed" from "we cancelled
+            # it." Without this we silently treat all early exits
+            # the same way and the user has no idea why their 720s
+            # decode ran for 74s.
+            exit_code = await proc.stop()
+            if exit_code is not None and exit_code != 0:
+                log.warning(
+                    "rtl_433[%s@%s] exited with code %d "
+                    "(emitted %d decode(s) before exit)",
+                    lease.dongle.id, freq_hz, exit_code,
+                    result.decodes_emitted,
+                )
+                result.errors.append(
+                    f"rtl_433 exit code {exit_code}"
+                )
         return result
 
 

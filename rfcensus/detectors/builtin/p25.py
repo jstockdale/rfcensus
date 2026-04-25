@@ -74,30 +74,51 @@ class P25Detector(DetectorBase):
         if not self._matches_bandwidth(event.bandwidth_hz):
             return
 
-        # Need continuous / modulated-continuous classification.
-        # Narrowband voice is usually `modulated_continuous` or `fm_voice`.
-        # Control channels are more like `continuous_carrier` / `modulated_continuous`.
+        # v0.6.2: accept a wider set of classifications.
+        #
+        # The pre-v0.6.2 filter required `continuous_carrier`,
+        # `modulated_continuous`, or `fm_voice` — all of which the
+        # SignalClassifier only assigns when active_ratio > 0.9. P25
+        # voice channels are keyed on/off (active_ratio typically 0.2-0.7
+        # in heavy traffic, much lower in quiet times) so they land in
+        # `intermittent` or `pulsed`. Even control channels frequently
+        # land in `intermittent` because of bin-level power variability.
+        # The result was: in a busy P25 system the detector NEVER
+        # FIRED, despite hundreds of P25 carriers visible in the band.
+        #
+        # New filter: accept `pulsed` and `intermittent` too. Precision
+        # is preserved by the bandwidth check (12.5 kHz ±30%), the band
+        # check (only public-safety frequency ranges), and the
+        # CHANNELS_FOR_TRUNKED_DETECTION threshold for non-dedicated
+        # bands. False positives in the 700/800 MHz dedicated bands are
+        # still very unlikely because almost nothing else lives there
+        # at narrowband 12.5 kHz spacing.
         if event.classification not in (
             "continuous_carrier",
             "modulated_continuous",
             "fm_voice",
+            "intermittent",
+            "pulsed",
         ):
             return
 
         self._continuous_channels.setdefault(band, set()).add(event.freq_center_hz)
         channel_count = len(self._continuous_channels[band])
 
-        # Single continuous narrowband channel: ambiguous (could be P25, NXDN, DMR, or
-        # analog repeater). Don't announce yet.
-        # Multiple 12.5 kHz channels in a public-safety band: trunked system is likely.
+        # Single narrowband channel: ambiguous in non-dedicated bands
+        # (could be P25, NXDN, DMR, or analog repeater). Don't announce
+        # yet. Multiple 12.5 kHz channels in a public-safety band:
+        # trunked system is likely.
         if band in self._announced:
             return
         if channel_count >= self.CHANNELS_FOR_TRUNKED_DETECTION:
             self._announced.add(band)
             await self._announce(band, event, trunked=True)
         elif channel_count >= 1 and self._is_dedicated_p25_band(band):
-            # 700/800 MHz public safety bands are dominated by P25; single
-            # channel there is enough evidence.
+            # 700/800 MHz public safety bands are dominated by P25; a
+            # single narrowband channel at the right spacing is enough
+            # evidence to flag it, even if classification was "intermittent"
+            # or "pulsed".
             self._announced.add(band)
             await self._announce(band, event, trunked=False)
 

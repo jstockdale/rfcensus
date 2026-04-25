@@ -31,6 +31,16 @@ class DecoderCapabilities:
     freq_ranges: tuple[tuple[int, int], ...]
     min_sample_rate: int = 1_024_000
     preferred_sample_rate: int = 2_400_000
+    # v0.6.9: True for decoders whose internal demodulator math hard-
+    # codes the sample rate they expect (rtlamr's 2,359,296 Hz is the
+    # canonical example — its DataRate, ChipLength, PreambleLength
+    # constants are derived from that exact rate, so feeding it any
+    # other rate produces wrong-clock output and silently broken
+    # decodes). When True AND the decoder is sharing a slot, the
+    # band-level rate-picker MUST honor this rate even if other
+    # co-scheduled decoders prefer something else (the flexible ones
+    # follow). Defaults False — most decoders adapt happily.
+    requires_exact_sample_rate: bool = False
     # If true, decoder wants to open the dongle directly (via -d index)
     # If false, decoder can connect to an rtl_tcp server
     requires_exclusive_dongle: bool = True
