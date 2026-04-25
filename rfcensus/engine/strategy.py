@@ -132,9 +132,26 @@ class DecoderOnlyStrategy(Strategy):
         for dr in decoder_results:
             if isinstance(dr, Exception):
                 result.errors.append(str(dr))
-            elif dr is not None:
+                continue
+            if dr is None:
+                continue
+            # v0.6.12: distinguish decoder-task results from lora_survey
+            # sidecar results. The survey returns a LoraSurveyStats
+            # which has detections_emitted (a separate event stream),
+            # not decodes_emitted. Without this branch we'd crash with
+            # "'LoraSurveyStats' object has no attribute 'decodes_
+            # emitted'" any time DecoderOnlyStrategy ran on a band
+            # with lora_survey enabled (which is exactly what
+            # 915_ism_r900 looks like as of v0.6.10).
+            if hasattr(dr, "decodes_emitted"):
                 result.decodes_emitted += dr.decodes_emitted
                 result.errors.extend(dr.errors)
+            elif hasattr(dr, "detections_emitted"):
+                # LoraSurveyStats: surface errors but don't count
+                # detections as decoder output (they go through the
+                # event bus as DetectionEvents instead).
+                if getattr(dr, "errors", None):
+                    result.errors.extend(dr.errors)
         return result
 
 
