@@ -5,6 +5,7 @@ rich>=13.7
 numpy>=1.26
 scipy>=1.11
 psutil>=5.9
+textual>=0.40
 
 [dev]
 pytest>=7.4

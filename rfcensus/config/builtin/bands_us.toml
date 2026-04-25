@@ -113,10 +113,19 @@ name = "915 ISM second pass — R900 at 912.6 MHz"
 freq_low = 911_400_000
 freq_high = 913_800_000
 region = "US"
-expected_signals = ["r900_meter", "r900bcd_meter", "ert_meter"]
+expected_signals = ["r900_meter", "r900bcd_meter", "ert_meter", "lora", "meshtastic"]
 suggested_decoders = ["rtlamr"]
 strategy = "decoder_only"
 typical_activity = "constant"
+# v0.6.10: passive LoRa-survey piggyback. The r900 band runs a shared
+# rtl_tcp at 912.6 MHz for rtlamr; this opts the same fanout into
+# chirp-pattern detection. Combined with the 915_ism band's survey at
+# 915.0 MHz, total passive coverage is now 911.64-915.96 MHz — wide
+# enough to cover Meshtastic LongFast slots 35-55 and MediumSlow at
+# slot 52 (914.875 MHz). The default LongFast slot 20 (906.875 MHz)
+# is still NOT covered passively; that needs Phase 2's active
+# channel-hop survey on a dedicated dongle.
+lora_survey = true
 # Custom rtlamr msgtype for this band: rather than "all" (scm+scm+,
 # idm, r900), target the protocols most likely to appear at 912.6
 # MHz. Including r900bcd here is fine because THIS rtlamr instance

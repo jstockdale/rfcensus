@@ -115,6 +115,19 @@ class DecoderOnlyStrategy(Strategy):
             )
             result.decoders_run.append(decoder.name)
 
+        # v0.6.10: passive LoRa-survey piggyback. When this band has a
+        # shared rtl_tcp fanout running for its decoders (e.g. 915_ism_
+        # r900 has rtlamr at 912.6 MHz) AND the band config opts in via
+        # `lora_survey = true`, attach a survey sidecar that taps the
+        # same fanout. This expands LoRa coverage to wherever we're
+        # already scanning in shared mode at zero extra hardware cost.
+        # Without this, lora_survey only ran on the bands explicitly
+        # using DecoderPrimaryStrategy, missing big chunks of the 915
+        # ISM band (the user's metatron deployment used 913.125 MHz
+        # which falls in the r900 band's window but not the 915_ism
+        # primary window).
+        _maybe_attach_lora_survey(band, ctx, tasks)
+
         decoder_results = await asyncio.gather(*tasks, return_exceptions=True)
         for dr in decoder_results:
             if isinstance(dr, Exception):
@@ -123,6 +136,40 @@ class DecoderOnlyStrategy(Strategy):
                 result.decodes_emitted += dr.decodes_emitted
                 result.errors.extend(dr.errors)
         return result
+
+
+def _maybe_attach_lora_survey(
+    band: BandConfig,
+    ctx: StrategyContext,
+    tasks: list[asyncio.Task],
+) -> None:
+    """Attach a deferred lora-survey sidecar to `tasks` if the band
+    opts in via `lora_survey = true`. Defers 2s so the primary
+    fanout (started by the band's main decoders) has come up before
+    the survey tries to allocate a shared lease against it.
+
+    Idempotent — call from any strategy that wants the sidecar
+    available; if `band.lora_survey` is False it's a no-op.
+
+    v0.6.10: used by both DecoderPrimaryStrategy (the original 915_ism
+    case) and DecoderOnlyStrategy (the new 915_ism_r900 case). When
+    Phase 2 active channel-hop survey lands, that gets its own band/
+    strategy with explicit dedicated decoders, separate from this
+    passive sidecar path.
+    """
+    if not band.lora_survey:
+        return
+
+    async def _deferred_lora_survey():
+        await asyncio.sleep(2.0)
+        return await _run_lora_survey(band, ctx)
+
+    tasks.append(
+        asyncio.create_task(
+            _deferred_lora_survey(),
+            name=f"lora_survey-{band.id}",
+        )
+    )
 
 
 # ------------------------------------------------------------
@@ -178,16 +225,10 @@ class DecoderPrimaryStrategy(Strategy):
         # rtl_power-based aggregator entirely — see lora_survey_task.py
         # for why that was structurally broken. Deferred 2s so the
         # primary fanout has come up and the shared lease can attach.
-        if band.lora_survey:
-            async def _deferred_lora_survey():
-                await asyncio.sleep(2.0)
-                return await _run_lora_survey(band, ctx)
-            tasks.append(
-                asyncio.create_task(
-                    _deferred_lora_survey(),
-                    name=f"lora_survey-{band.id}",
-                )
-            )
+        # v0.6.10: shared launcher used by BOTH DecoderPrimaryStrategy
+        # AND DecoderOnlyStrategy so e.g. the 915_ism_r900 band (which
+        # uses decoder_only) can also attach a survey to its fanout.
+        _maybe_attach_lora_survey(band, ctx, tasks)
 
         task_results = await asyncio.gather(*tasks, return_exceptions=True)
         for tr in task_results:

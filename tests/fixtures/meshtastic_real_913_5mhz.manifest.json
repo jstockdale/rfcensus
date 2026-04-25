@@ -1,0 +1,88 @@
+{
+  "source": "user-captured 30s @ 913.5 MHz, 2.4 Msps, RTL-SDR + whip_915",
+  "sample_rate": 2400000,
+  "center_freq_hz": 913500000,
+  "format": "cu8 (interleaved unsigned 8-bit IQ pairs)",
+  "windows": [
+    {
+      "label": "burst_at_0.40s",
+      "source_start_s": 0.4,
+      "duration_s": 0.35,
+      "fixture_start_sample": 0,
+      "fixture_end_sample": 840000,
+      "expected_hits": 1
+    },
+    {
+      "label": "burst_at_3.75s",
+      "source_start_s": 3.75,
+      "duration_s": 0.35,
+      "fixture_start_sample": 840000,
+      "fixture_end_sample": 1680000,
+      "expected_hits": 1
+    },
+    {
+      "label": "burst_at_8.50s",
+      "source_start_s": 8.5,
+      "duration_s": 0.35,
+      "fixture_start_sample": 1680000,
+      "fixture_end_sample": 2520000,
+      "expected_hits": 1
+    },
+    {
+      "label": "burst_at_13.75s",
+      "source_start_s": 13.75,
+      "duration_s": 0.35,
+      "fixture_start_sample": 2520000,
+      "fixture_end_sample": 3360000,
+      "expected_hits": 1
+    },
+    {
+      "label": "burst_at_19.25s",
+      "source_start_s": 19.25,
+      "duration_s": 0.35,
+      "fixture_start_sample": 3360000,
+      "fixture_end_sample": 4200000,
+      "expected_hits": 1
+    },
+    {
+      "label": "twin_burst_at_21.40s",
+      "source_start_s": 21.4,
+      "duration_s": 0.4,
+      "fixture_start_sample": 4200000,
+      "fixture_end_sample": 5160000,
+      "expected_hits": 1
+    },
+    {
+      "label": "twin_burst_at_25.50s",
+      "source_start_s": 25.5,
+      "duration_s": 0.5,
+      "fixture_start_sample": 5160000,
+      "fixture_end_sample": 6360000,
+      "expected_hits": 1
+    },
+    {
+      "label": "burst_at_29.00s",
+      "source_start_s": 29.0,
+      "duration_s": 0.35,
+      "fixture_start_sample": 6360000,
+      "fixture_end_sample": 7200000,
+      "expected_hits": 1
+    },
+    {
+      "label": "quiet_baseline_16s",
+      "source_start_s": 16.0,
+      "duration_s": 0.35,
+      "fixture_start_sample": 7200000,
+      "fixture_end_sample": 8040000,
+      "expected_hits": 0
+    },
+    {
+      "label": "quiet_baseline_5s",
+      "source_start_s": 5.0,
+      "duration_s": 0.35,
+      "fixture_start_sample": 8040000,
+      "fixture_end_sample": 8880000,
+      "expected_hits": 0
+    }
+  ]
+}

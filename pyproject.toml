@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rfcensus"
-version = "0.6.9"
+version = "0.6.10"
 description = "A site survey and inventory tool for the RF environment around you"
 readme = "README.md"
 requires-python = ">=3.11"
