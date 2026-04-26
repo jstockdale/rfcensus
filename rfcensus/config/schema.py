@@ -318,6 +318,165 @@ class DecoderConfig(BaseModel):
 
 
 # ------------------------------------------------------------
+# Meshtastic decoder
+# ------------------------------------------------------------
+
+
+class MeshtasticPskEntry(BaseModel):
+    """One channel PSK for the Meshtastic decoder.
+
+    Exactly one of ``psk_b64``, ``psk_hex``, or ``psk_short`` must be
+    provided. The channel is identified at decode time by hashing
+    ``(name, psk)`` and matching against the wire-side hash on each
+    received packet.
+
+    Forms:
+      • ``psk_b64`` — base64-encoded 16- or 32-byte AES key. This is
+        the form Meshtastic apps export (the "channel URL" QR code
+        contains base64 PSKs).
+      • ``psk_hex`` — hex-encoded key. Same byte length rules.
+      • ``psk_short`` — 1..255 short-PSK form. The C library expands
+        ``b"\\x01"`` to MESH_DEFAULT_PSK; ``b"\\x02"`` to that PSK
+        with the last byte bumped, and so on. Used by Meshtastic for
+        preconfigured channels with predictable PSKs.
+
+    Examples (in site.toml):
+
+        [[decoders.meshtastic.psks]]
+        name = "MyPrivate"
+        psk_b64 = "1PG7OiApB1nwvP+rz05pAQ=="
+
+        [[decoders.meshtastic.psks]]
+        name = "DadsLink"
+        psk_hex = "deadbeef..."
+
+        [[decoders.meshtastic.psks]]
+        name = "OldChannel"
+        psk_short = 1
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    psk_b64: str | None = None
+    psk_hex: str | None = None
+    psk_short: int | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _name_nonempty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("PSK 'name' must be non-empty")
+        return v
+
+    @field_validator("psk_short")
+    @classmethod
+    def _psk_short_in_range(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if not 1 <= v <= 255:
+            raise ValueError(
+                f"psk_short must be in 1..255, got {v}"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _exactly_one_psk_form(self) -> "MeshtasticPskEntry":
+        forms = [
+            self.psk_b64 is not None,
+            self.psk_hex is not None,
+            self.psk_short is not None,
+        ]
+        n = sum(forms)
+        if n == 0:
+            raise ValueError(
+                f"PSK entry {self.name!r} must provide one of "
+                "psk_b64, psk_hex, or psk_short"
+            )
+        if n > 1:
+            raise ValueError(
+                f"PSK entry {self.name!r} provides multiple key forms; "
+                "use exactly one of psk_b64, psk_hex, psk_short"
+            )
+        # Validate decoded length when given as b64/hex
+        if self.psk_b64 is not None:
+            import base64
+            try:
+                key = base64.b64decode(self.psk_b64, validate=True)
+            except Exception as exc:
+                raise ValueError(
+                    f"PSK {self.name!r} psk_b64 not valid base64: {exc}"
+                ) from exc
+            if len(key) not in (16, 32):
+                raise ValueError(
+                    f"PSK {self.name!r} psk_b64 decoded to {len(key)} "
+                    "bytes; must be 16 (AES-128) or 32 (AES-256)"
+                )
+        if self.psk_hex is not None:
+            try:
+                key = bytes.fromhex(self.psk_hex)
+            except Exception as exc:
+                raise ValueError(
+                    f"PSK {self.name!r} psk_hex not valid hex: {exc}"
+                ) from exc
+            if len(key) not in (16, 32):
+                raise ValueError(
+                    f"PSK {self.name!r} psk_hex decoded to {len(key)} "
+                    "bytes; must be 16 (AES-128) or 32 (AES-256)"
+                )
+        return self
+
+
+class MeshtasticDecoderConfig(DecoderConfig):
+    """Typed configuration for the Meshtastic decoder.
+
+    Site config can use either the loose dict form (``[decoders.meshtastic]``
+    + free-form keys, deserializing as a plain ``DecoderConfig`` thanks
+    to ``extra="allow"``) OR this typed form for static validation.
+
+    The loader prefers the typed form when the section name matches —
+    this gives users early errors for malformed PSKs (e.g. wrong base64
+    padding, wrong key length, missing name) instead of silent failures
+    at decode time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # Region code for slot enumeration. One of "US", "EU_868", "EU_433",
+    # "CN", "JP", "KR", "TW", "RU", "IN", "NZ_865", "TH", "UA_433",
+    # "ANZ", "MY_433", "MY_919", "SG_923".
+    region: str = "US"
+
+    # "all" enumerates every (preset, slot) in the dongle's passband.
+    # "default" is just each preset's default-channel slot. "all" is
+    # cheap thanks to the lazy pipeline and catches custom-named
+    # channels too.
+    slots: Literal["all", "default"] = "all"
+
+    # Per-channel PSKs. The public default-channel PSK is loaded
+    # automatically; only add entries here for custom-named channels
+    # whose PSK you know.
+    psks: list[MeshtasticPskEntry] = Field(default_factory=list)
+
+    # v0.7.4: when True (the default), the meshtastic decoder is
+    # automatically added to every band whose frequency range
+    # overlaps Meshtastic's freq_ranges (902-928 MHz, 868 MHz,
+    # 433 MHz). This is what users expect when they "enable a
+    # decoder" — they shouldn't have to hand-edit every band's
+    # suggested_decoders list. Set to False to opt out and
+    # manually wire meshtastic into specific bands via
+    # band_definitions overrides.
+    #
+    # Why this matters: bands_us.toml lists "meshtastic" in
+    # expected_signals for 915_ism and 915_ism_r900 but NOT in
+    # suggested_decoders. Without auto_attach, the decoder is
+    # registered but never scheduled, leading to the empty
+    # "No Meshtastic packets seen yet" pane regardless of how
+    # `enabled` is set.
+    auto_attach: bool = True
+
+
+# ------------------------------------------------------------
 # Privacy and policy
 # ------------------------------------------------------------
 

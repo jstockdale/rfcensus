@@ -137,6 +137,50 @@ def style_for_dongle_status(status: str) -> str:
     }.get(status, "info")
 
 
+def dongle_border_color(
+    status: str,
+    has_decodes: bool,
+    has_warnings: bool = False,
+) -> str:
+    """v0.6.14: map dongle (status, has_decodes) → Textual color name
+    for the tile's border.
+
+    Four-state palette decoupled from selection state (selection is
+    encoded by border STYLE — heavy vs round — so it can stack with
+    any color):
+
+      • green   — active and producing decodes/detections
+      • grey    — running but nothing decoded yet (the common early
+                  state; not noteworthy)
+      • yellow  — degraded / transient warning / needs a look
+      • red     — failed / permanent error
+
+    v0.7.4: ``has_warnings`` flag added so slow-chunk events on the
+    fanout can color the tile yellow even when status is "active".
+    Without this, a dongle that's actively producing decodes but
+    backpressuring its fanout consumers stayed green and the user
+    had no at-a-glance signal that the fanout was struggling.
+
+    Without this, the strip used a single "accent" color for focus
+    that overloaded yellow with both 'warning' and 'selected', and
+    the user had no at-a-glance way to know which tiles had actually
+    produced output.
+    """
+    if status in ("failed", "permanent_failed"):
+        return "red"
+    if status == "degraded":
+        return "yellow"
+    if has_warnings:
+        # Warnings (slow fanout chunks etc.) override the
+        # active-with-decodes "everything's fine" green so the user
+        # notices. Yellow here is "still working, but needs a look."
+        return "yellow"
+    if status == "active" and has_decodes:
+        return "green"
+    # active-no-decodes, idle, unknown → neutral grey
+    return "grey50"
+
+
 def style_for_severity(severity: str) -> str:
     """Map StreamEntry.severity → style name."""
     return {

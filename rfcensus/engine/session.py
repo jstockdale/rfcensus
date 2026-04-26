@@ -65,6 +65,17 @@ class SessionResult:
     strategy_results: list[StrategyResult] = field(default_factory=list)
     total_decodes: int = 0
     warnings: list[str] = field(default_factory=list)
+    # v0.7.4: True when the session exited because of a user stop
+    # request (Ctrl-C, TUI q+y, TUI q+f) rather than running to its
+    # planned completion. The report renderer marks the output as
+    # INCOMPLETE when this is set so the user knows that absent
+    # detections / undecided bands are due to early termination
+    # rather than confirmed silence.
+    stopped_early: bool = False
+    # v0.7.4: number of planned tasks that didn't get to execute
+    # (i.e. were in waves the loop skipped after stop_requested).
+    # Computed by the runner before returning the result.
+    tasks_skipped_due_to_stop: int = 0
 
 
 @dataclass
@@ -164,6 +175,19 @@ class SessionRunner:
         # retries. Promoted from local var to instance attr so retries
         # can append.
         self._strategy_results: list[StrategyResult] = []
+        # v0.7.5: stashed during run() so the TUI snapshot report can
+        # render against the real DB via ReportBuilder, mirroring the
+        # final-report quality. None before run() starts.
+        self._current_plan: ExecutionPlan | None = None
+        self._current_session_id: int | None = None
+        # v0.7.6: set by inventory.py before runner.run() when the
+        # TUI is the active controller. The runner uses it to skip
+        # installing its own SIGINT handler — Textual captures
+        # Ctrl+C as a key event and routes it to the TUI's
+        # action_quit_session for the ConfirmQuit modal. Two
+        # handlers competing for Ctrl+C produced confusing behavior
+        # (silent stop + visible modal both firing).
+        self.tui_active: bool = False
         # Set during run() so sidecar retries can spawn strategies
         self._dispatcher = None
         self._ctx = None
@@ -716,6 +740,13 @@ class SessionRunner:
         )
         bands = self.config.enabled_bands()
         plan = scheduler.plan(bands)
+        # v0.7.5: stash on self so the TUI's `r` snapshot report can
+        # synthesize a partial SessionResult and run the same
+        # ReportBuilder pipeline as the final report. Without this,
+        # the TUI report had to parse event-stream strings to
+        # reconstruct band activity — much lower fidelity than a
+        # DB-backed render.
+        self._current_plan = plan
         log.info(
             "plan: %d wave(s), %d task(s) total",
             len(plan.waves), len(plan.tasks),
@@ -826,16 +857,27 @@ class SessionRunner:
         # stop_requested; we finish the current band then exit. Second
         # Ctrl-C restores the default handler so KeyboardInterrupt fires
         # immediately.
+        #
+        # v0.7.6: skip the install when the TUI owns the terminal.
+        # Textual captures Ctrl+C as a key event and routes it to the
+        # TUI's bound action_quit_session, which presents the
+        # ConfirmQuit modal. If we ALSO install our own SIGINT handler
+        # here, both fire on Ctrl+C — the TUI shows the modal AND the
+        # runner silently flips _stop_requested behind it. The user
+        # then picks "cancel" in the modal but the wave still wraps
+        # up unexpectedly. Disabling our handler when self.tui_active
+        # is True makes the TUI the sole authority for Ctrl+C.
         loop = asyncio.get_event_loop()
         sigint_installed = False
-        try:
-            loop.add_signal_handler(signal.SIGINT, self._handle_sigint)
-            sigint_installed = True
-        except (NotImplementedError, RuntimeError):
-            # Some platforms (Windows under certain conditions) don't allow
-            # signal handlers in the asyncio loop. Fall back silently — the
-            # default SIGINT behavior (KeyboardInterrupt) still works.
-            pass
+        if not getattr(self, "tui_active", False):
+            try:
+                loop.add_signal_handler(signal.SIGINT, self._handle_sigint)
+                sigint_installed = True
+            except (NotImplementedError, RuntimeError):
+                # Some platforms (Windows under certain conditions) don't allow
+                # signal handlers in the asyncio loop. Fall back silently — the
+                # default SIGINT behavior (KeyboardInterrupt) still works.
+                pass
 
         try:
             pass_n = 0
@@ -1219,6 +1261,16 @@ class SessionRunner:
             log.warning("final SessionEvent publish timed out; continuing")
 
         total_decodes = sum(r.decodes_emitted for r in self._strategy_results)
+        # v0.7.4: report skipped tasks so the report can mark the
+        # session INCOMPLETE and tell the user exactly what didn't run.
+        # A "skipped" task is one that was in the plan but never made
+        # it into a StrategyResult (the wave loop exited before it
+        # ran, typically because of a stop request mid-pass).
+        executed_band_ids = {r.band_id for r in self._strategy_results}
+        skipped = sum(
+            1 for task in plan.tasks
+            if task.band.id not in executed_band_ids
+        )
         return SessionResult(
             session_id=session_id,
             started_at=started,
@@ -1227,4 +1279,6 @@ class SessionRunner:
             strategy_results=self._strategy_results,
             total_decodes=total_decodes,
             warnings=list(plan.warnings),
+            stopped_early=self._stop_requested,
+            tasks_skipped_due_to_stop=(skipped if self._stop_requested else 0),
         )

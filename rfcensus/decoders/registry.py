@@ -68,13 +68,16 @@ def get_registry() -> DecoderRegistry:
     if _REGISTRY is None:
         _REGISTRY = DecoderRegistry()
         # Deferred import to avoid circular dependencies
-        from rfcensus.decoders.builtin import rtl_433, rtl_ais, rtlamr, multimon, direwolf  # noqa: F401
+        from rfcensus.decoders.builtin import (   # noqa: F401
+            rtl_433, rtl_ais, rtlamr, multimon, direwolf, meshtastic,
+        )
 
         _REGISTRY.register(rtl_433.Rtl433Decoder)
         _REGISTRY.register(rtlamr.RtlamrDecoder)
         _REGISTRY.register(rtl_ais.RtlAisDecoder)
         _REGISTRY.register(multimon.MultimonDecoder)
         _REGISTRY.register(direwolf.DirewolfDecoder)
+        _REGISTRY.register(meshtastic.MeshtasticBuiltinDecoder)
     return _REGISTRY
 
 

@@ -94,17 +94,50 @@ def render_text_report(
     include_ids: bool = False,
     site_name: str = "default",
     previously_known_ids: set[int] | None = None,
+    command_name: str = "inventory",
 ) -> str:
     detections = detections or []
     active_channels = active_channels or []
     lines: list[str] = []
     lines.append("═" * 72)
-    lines.append(f" rfcensus inventory report — session {result.session_id}")
+    # v0.6.15: name the report after the command that produced it.
+    # Was hardcoded "inventory report" which was wrong/confusing for
+    # `rfcensus scan` and `rfcensus hybrid` runs that share this code.
+    lines.append(
+        f" rfcensus {command_name} report — session {result.session_id}"
+    )
     lines.append(f" site: {site_name}")
     lines.append(f" started: {_fmt(result.started_at)}")
     lines.append(f" ended:   {_fmt(result.ended_at)}")
     duration = (result.ended_at - result.started_at).total_seconds()
     lines.append(f" duration: {_humanize_duration(duration)}")
+    # v0.7.4: surface early-termination prominently in the report
+    # header so the user knows that absent emitters / undecided bands
+    # are due to the scan being cut short, not confirmed-silent.
+    if getattr(result, "stopped_early", False):
+        lines.append("═" * 72)
+        lines.append(" ⚠ INCOMPLETE — session stopped before plan finished")
+        n_skipped = getattr(result, "tasks_skipped_due_to_stop", 0)
+        n_total = len(result.plan.tasks)
+        n_done = n_total - n_skipped
+        lines.append(
+            f" {n_done}/{n_total} planned task(s) executed; "
+            f"{n_skipped} skipped due to early stop"
+        )
+        if n_skipped > 0:
+            # List the bands that didn't run so the user knows what's
+            # missing from the report (vs. truly silent).
+            executed_bands = {
+                r.band_id for r in result.strategy_results
+            }
+            skipped_bands = sorted({
+                t.band.id for t in result.plan.tasks
+                if t.band.id not in executed_bands
+            })
+            if skipped_bands:
+                lines.append(
+                    " skipped band(s): " + ", ".join(skipped_bands)
+                )
     lines.append("═" * 72)
 
     if not include_ids:
@@ -125,6 +158,20 @@ def render_text_report(
         lines.append("Warnings:")
         for w in result.plan.warnings:
             lines.append(f"  • {w}")
+
+    # v0.6.15: Diagnostics block. Surfaces fixable failure modes
+    # near the TOP of the report so the user notices them before
+    # scrolling through detected emitters / mystery carriers. Each
+    # section corresponds to a different remediation path; if a
+    # section is empty we omit it entirely so an all-clean report
+    # stays compact.
+    diag_lines = _render_diagnostics(result.strategy_results)
+    if diag_lines:
+        lines.append("")
+        lines.append("─" * 72)
+        lines.append(" Diagnostics")
+        lines.append("─" * 72)
+        lines.extend(diag_lines)
 
     # Emitters grouped by protocol
     lines.append("")
@@ -265,10 +312,45 @@ def render_text_report(
     lines.append("─" * 72)
     for sr in result.strategy_results:
         lines.append(
-            f"  {sr.band_id}: decoders={','.join(sr.decoders_run) or 'none'}"
-            f"  power_scan={'yes' if sr.power_scan_performed else 'no'}"
+            f"  {sr.band_id}: power_scan={'yes' if sr.power_scan_performed else 'no'}"
             f"  decodes={sr.decodes_emitted}"
         )
+        # v0.6.15: per-decoder breakdown so the user can tell
+        # "everything ran fine, band was silent" from "one decoder
+        # is missing its binary." Each line: name, decode count, why
+        # it ended.
+        if sr.decoder_runs:
+            for dr in sr.decoder_runs:
+                # ended_reason interpretation:
+                #   ""               — completed normally (ran the wave)
+                #   "duration"       — same: ran the wave, nothing decoded
+                #   "binary_missing" — decoder binary not installed
+                #   "wrong_lease_type" — lease/decoder mismatch (config bug)
+                #   "error"          — exception / bad data
+                #   "hardware_lost"  — USB unplug / dongle reset
+                #   "cancelled"      — user-requested stop
+                #   "upstream_eof"   — fanout died (often = upstream crash)
+                reason = dr.ended_reason or "completed"
+                marker = " " if dr.decodes_emitted > 0 else "·"
+                # Flag fixable failure modes with ! so they jump out
+                if reason in (
+                    "binary_missing", "wrong_lease_type",
+                    "error", "hardware_lost", "upstream_eof",
+                ):
+                    marker = "!"
+                lines.append(
+                    f"    {marker} {dr.name:<10s} decodes={dr.decodes_emitted}"
+                    f"  ended={reason}"
+                )
+        elif sr.decoders_run:
+            # Strategy didn't fill in the per-decoder breakdown
+            # (older code path or unusual strategy). Fall back to the
+            # bare decoder list so we don't lose info.
+            lines.append(
+                f"      decoders: {','.join(sr.decoders_run)}"
+            )
+        else:
+            lines.append("      (no decoders configured)")
         for err in sr.errors:
             lines.append(f"    ! {err}")
 
@@ -281,6 +363,79 @@ def render_text_report(
 
 def _fmt(dt: datetime) -> str:
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _render_diagnostics(strategy_results) -> list[str]:
+    """v0.6.15: build the Diagnostics section.
+
+    Three buckets, each gets its own paragraph if non-empty:
+      • Decoders that couldn't start (binary missing / config bug).
+        Fix path: install the binary or correct the band config.
+      • Decoders that crashed mid-run (errors, hardware loss, eof).
+        Fix path: investigate logs or hardware.
+      • Bands where everything ran fine but produced 0 decodes.
+        These are the "genuinely silent / nothing in the air" cases —
+        not necessarily a bug, but worth knowing so you don't add
+        decoders trying to fix what isn't broken.
+
+    Empty list ⇒ caller skips the whole section header.
+    """
+    cant_start: list[tuple[str, str, str]] = []  # (band, decoder, reason)
+    crashed: list[tuple[str, str, str, list[str]]] = []
+    silent_bands: list[str] = []
+
+    silent_reasons = {"", "completed", "duration", "cancelled"}
+    cant_start_reasons = {"binary_missing", "wrong_lease_type"}
+    crashed_reasons = {"error", "hardware_lost", "upstream_eof"}
+
+    for sr in strategy_results:
+        for dr in sr.decoder_runs:
+            if dr.ended_reason in cant_start_reasons:
+                cant_start.append((sr.band_id, dr.name, dr.ended_reason))
+            elif dr.ended_reason in crashed_reasons:
+                crashed.append(
+                    (sr.band_id, dr.name, dr.ended_reason, dr.errors)
+                )
+        # A band counts as "silent" if it had decoders that all ran
+        # to completion (no can't-start, no crashed) AND produced
+        # zero decodes. We exclude bands that detected things via
+        # detectors (lora_survey etc.) — silent means decoder-silent.
+        if sr.decoders_run and sr.decodes_emitted == 0 and not any(
+            dr.ended_reason in (cant_start_reasons | crashed_reasons)
+            for dr in sr.decoder_runs
+        ):
+            if all(
+                dr.ended_reason in silent_reasons
+                for dr in sr.decoder_runs
+            ) and sr.decoder_runs:
+                silent_bands.append(sr.band_id)
+
+    out: list[str] = []
+    if cant_start:
+        out.append("  Decoders that couldn't start "
+                   "(install the binary or fix config):")
+        for band_id, name, reason in cant_start:
+            out.append(f"    ! {band_id}/{name} — {reason}")
+        out.append("")
+    if crashed:
+        out.append("  Decoders that crashed mid-run "
+                   "(check logs / hardware):")
+        for band_id, name, reason, errors in crashed:
+            err_summary = errors[0] if errors else "(no error message)"
+            out.append(f"    ! {band_id}/{name} — {reason} — {err_summary}")
+        out.append("")
+    if silent_bands:
+        out.append("  Bands silent for the full wave "
+                   "(decoders ran fine, nothing in the air):")
+        # Wrap to ~60 chars per line so this stays readable for a
+        # site like metatron with 8+ silent bands
+        chunk = "    " + ", ".join(silent_bands)
+        out.append(chunk)
+        out.append("")
+    # Trim trailing blank line
+    while out and out[-1] == "":
+        out.pop()
+    return out
 
 
 def _humanize_duration(seconds: float) -> str:

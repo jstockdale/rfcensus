@@ -13,6 +13,11 @@ doesn't recognize for you to investigate.
 Alpha. Being built in the open. Expect rough edges, sharp corners, and
 occasional bleeding.
 
+The native LoRa + Meshtastic decoder pipeline is the most active area
+of development right now. The subprocess-based decoders (rtl_433,
+rtlamr, rtl-ais, multimon-ng, direwolf) are stable and unlikely to
+churn.
+
 ## What it does today
 
 • Enumerates RTL-SDR and HackRF hardware on your system, with a friendly
@@ -21,8 +26,11 @@ occasional bleeding.
   so non-conflicting bands run simultaneously instead of sequentially
 • Optimizes antenna→dongle assignment across your fleet so each band is
   served by the best-matched antenna available
-• Runs five built-in decoders (rtl_433, rtlamr, rtl-ais, multimon-ng,
-  direwolf) and three detectors (LoRa, P25, WiFi/BT-ISM)
+• Runs five subprocess decoders (rtl_433, rtlamr, rtl-ais, multimon-ng,
+  direwolf) and one in-process decoder (Meshtastic, with full
+  AES-128/256-CTR decrypt and PKI key recovery from NodeInfo)
+• Detects pattern-based signals it doesn't decode itself: P25 control
+  channels, WiFi/BT carriers in 2.4 GHz ISM
 • Power scans with rtl_power or hackrf_sweep depending on hardware,
   with a wide-channel aggregator that recognizes wide signals (LoRa,
   Meshtastic) by their FFT footprint
@@ -35,18 +43,29 @@ occasional bleeding.
   long-running coverage of targets you care about
 • Persists everything to SQLite with retention windows; supports
   baseline-and-diff comparison across sessions
+• Optional interactive TUI dashboard (`--tui`) showing live dongle
+  activity, recent decodes, and a Meshtastic-specific recent-traffic
+  pane
+• Standalone `rfcensus-meshtastic-decode` CLI for offline `.cu8`
+  capture analysis or live RTL-SDR / rtl_tcp decoding without the
+  full survey machinery
+• PCAP export (DLT_LORATAP) for cross-checking LoRa / Meshtastic
+  captures against Wireshark
 • Privacy-preserving by default – device IDs are hashed in reports unless
   you opt in to raw values
 
 ## What it doesn't do yet
 
-• No TUI / web UI (the next big feature on the roadmap)
+• No web UI (the TUI ships, but a web dashboard is not on the
+  short-term roadmap)
 • No satellite pass prediction + SatDump hand-off
 • No P25 trunk-following (identifies P25 control channels and recommends
   SDRTrunk)
 • No ADS-B decoding – mature ecosystem already exists (dump1090, readsb,
   tar1090, FlightAware Feeder); rfcensus stays out of that lane
 • No multi-site location mapping (planned alongside GPS support)
+• No TDOA / multilateration across distributed receivers (long-term
+  goal – would let a fleet of cheap nodes geolocate emitters)
 
 ## Concepts
 
@@ -71,9 +90,11 @@ this document make sense.
   are defined out of the box for the US; you can enable, disable, or
   add your own.
 
-• **Decoder** – a subprocess decoder that produces structured decodes
-  from IQ data (rtl_433 for OOK/FSK ISM devices, rtlamr for utility
-  meters, etc.).
+• **Decoder** – a component that produces structured decodes from
+  IQ data. Most decoders shell out to a subprocess binary (rtl_433
+  for OOK/FSK ISM devices, rtlamr for utility meters, etc.); the
+  Meshtastic decoder is in-process and uses the in-tree native
+  LoRa+AES libraries.
 
 • **Detector** – a pattern recognizer that flags signals without
   decoding them (LoRa chirps, P25 control channels, WiFi/BT carriers
@@ -97,7 +118,8 @@ this document make sense.
 # Install the Python package
 pip install -e .
 
-# Install the external decoder binaries (Debian/Ubuntu)
+# Install the external decoder binaries AND build the in-tree native
+# LoRa + Meshtastic libraries (Debian/Ubuntu)
 ./scripts/install_decoders.sh
 # Or --all to include optional HackRF and direwolf:
 ./scripts/install_decoders.sh --all
@@ -115,8 +137,25 @@ rfcensus doctor
 # Quick survey of what's at your site
 rfcensus scan --duration 5m
 
+# Or with the live dashboard
+rfcensus scan --duration 5m --tui
+
 # See what was identified
 rfcensus list emitters
+```
+
+For Meshtastic-specific work without the survey machinery, the
+standalone tool is often what you want:
+
+```bash
+# Live decode from an RTL-SDR, all presets that fit in the dongle's
+# passband, automatically choosing center frequency
+rfcensus-meshtastic-decode --rtl-sdr --region US
+
+# Decode an offline cu8 capture and write a Wireshark-readable pcap
+rfcensus-meshtastic-decode capture.cu8 \
+    --frequency 913500000 --sample-rate 2400000 \
+    --preset MEDIUM_FAST --pcap out.pcap
 ```
 
 ## Commands
@@ -144,7 +183,7 @@ Three categories: setup-time, runtime, and inspection.
 | `rfcensus scan` | Quick discovery pass. *5 min default, single pass per band.* What's even at this site? |
 | `rfcensus inventory` | Exhaustive enumeration. *Defaults to forever.* Round-robins through every band repeatedly. Catches intermittent emitters. |
 | `rfcensus hybrid` | Inventory + decoder pinning. *Defaults to forever.* The only command that honors pinned dongles; the rest run the normal exploration scan. |
-| `rfcensus monitor BAND` | Watch one specific band live. Streams decodes to stdout. Used for narrow follow-up after `inventory` surfaces something interesting. |
+| `rfcensus monitor --band BAND` | Watch one specific band live. Streams decodes to stdout. Used for narrow follow-up after `inventory` surfaces something interesting. |
 
 **Inspection** – looking at what was found
 
@@ -346,29 +385,114 @@ After `inventory` surfaces an unknown carrier or a particularly noisy
 band, point a dongle at it directly:
 
 ```bash
-rfcensus monitor 433_ism
+rfcensus monitor --band 433_ism
 # Streams decodes live to stdout; --save to also persist them
 ```
 
+## LoRa and Meshtastic
+
+The native LoRa pipeline is the most substantial decoder rfcensus
+ships in-tree. It demodulates LoRa chirps end-to-end (preamble
+detection, sync, dechirp, header decode, payload extraction, CRC
+validation) and hands the resulting frames to the Meshtastic
+parser, which decrypts AES-CTR payloads, parses the protobuf
+contents, and recovers PKI public keys from NodeInfo dumps for
+direct-message decryption.
+
+Two ways to use it:
+
+**As part of a survey** – the `meshtastic` decoder is registered
+like any other and runs automatically on every enabled band whose
+frequency range overlaps Meshtastic's regional ranges (902-928 MHz
+in the US, 868 MHz in the EU, 433 MHz where applicable). It joins
+the band's rtl_tcp fanout so it shares a dongle with `rtl_433` and
+`rtlamr` rather than monopolizing one. PSKs for custom-named
+channels go in `[[decoders.meshtastic.psks]]` in `site.toml` (b64,
+hex, or short-PSK forms – the b64 form is what the Meshtastic app
+exports in channel-URL QR codes).
+
+**As a standalone CLI** – `rfcensus-meshtastic-decode` is a single
+focused tool that takes either an offline `.cu8` file, a live
+RTL-SDR, or an `rtl_tcp` server as input and writes packets to
+stdout, JSONL, and/or pcap.
+
+```bash
+# Offline cu8, all presets in the dongle's passband, default region (US)
+rfcensus-meshtastic-decode capture.cu8 \
+    --frequency 913500000 --sample-rate 2400000
+
+# Live RTL-SDR, only MediumFast, with channel hopping
+rfcensus-meshtastic-decode --rtl-sdr --preset MEDIUM_FAST --hop
+
+# Share a dongle with another tool via rtl_tcp
+rfcensus-meshtastic-decode --rtl-tcp localhost:1234 \
+    --preset all --jsonl out.jsonl --pcap out.pcap
+
+# Custom PSKs (for non-default channels)
+rfcensus-meshtastic-decode --rtl-sdr \
+    --psk MyChannel:1a2b3c4d5e6f...
+
+# List the regions and presets known
+rfcensus-meshtastic-decode --list-presets
+```
+
+The pcap output uses LoRaTap framing (DLT_LORATAP, link-layer type
+270), which Wireshark dissects natively. Combined with the
+community Meshtastic Wireshark dissector you get full per-packet
+visibility into the MeshPacket protobuf.
+
+Supported regions: US, EU_433, EU_868, CN, JP, ANZ, ANZ_433, KR,
+TW, IN, NZ_865, TH, RU. All standard Meshtastic presets are known
+(LongFast, MediumFast, ShortFast, ShortTurbo, plus the slow / turbo
+variants and LongModerate).
+
+## TUI
+
+`rfcensus scan --tui`, `rfcensus inventory --tui`, and
+`rfcensus hybrid --tui` open an interactive dashboard while the
+session runs. Layout: a strip of dongles with live activity, a
+plan tree showing the current wave + queued waves, an event stream
+showing decodes as they happen, and a Meshtastic-recent pane when
+the Meshtastic decoder is active. Falls back to the normal log
+output if the terminal is too small (<80×24) or if stdout is
+piped.
+
+Honors `NO_COLOR`. `--no-color` does the same explicitly.
+
 ## What's inside
 
-**Decoders** – `rtl_433`, `rtlamr`, `rtl-ais`, `multimon-ng`, `direwolf`.
-Each subprocess-invoked, so license isolation is clean and you only
-need the binaries for the decoders you use.
+**Subprocess decoders** – `rtl_433`, `rtlamr`, `rtl-ais`, `multimon-ng`,
+`direwolf`. Each is invoked as a subprocess so license isolation is
+clean and you only need the binaries for the decoders you use.
+
+**In-process decoder: Meshtastic.** The full LoRa demodulator and
+Meshtastic packet parser ship as in-tree C/C++ libraries
+(`liblora_demod.so`, `libmeshtastic.so`) that the Python pipeline
+loads via ctypes. There is no stand-alone CLI binary for
+LoRa→Meshtastic decryption from raw IQ in the wild, so we built one.
+Features: AES-128 / AES-256-CTR decrypt with the well-known default
+PSK or any user-configured PSKs; channel hash matching; PKI
+public-key recovery from NodeInfo dumps; all standard Meshtastic
+PortNums (text, position, telemetry, traceroute, nodeinfo) decoded
+inline. The pipeline is preset-aware (LongFast, MediumFast,
+ShortFast, ShortTurbo, Long/Medium Slow, Long Turbo, Long Moderate)
+and runs every preset whose frequency slot falls in the dongle's
+passband in parallel.
 
 **Detectors** – pattern-based recognizers that flag signals without
-needing a full decoder: `lora` (chirp detection), `p25` (control
-channel detection), `wifi_bt_ism` (WiFi + Bluetooth carriers in 2.4
-GHz ISM).
+needing a full decoder: `p25` (control channel detection),
+`wifi_bt_ism` (WiFi + Bluetooth carriers in 2.4 GHz ISM). Hand-off
+recommendations are baked in (SDRTrunk for P25 trunking, Kismet /
+Ubertooth / Sniffle for 2.4 GHz).
 
 **Default US band catalogue** (21 bands) – security/TPMS/keyfob (315,
 319.5, 345, 433.92), ISM (915), paging (929), AIS (162), APRS
 (144.39), NOAA weather, marine VHF, business VHF/UHF, P25 700/800,
-70cm amateur, ACARS (131), and a few more. The catalogue also defines
-a couple of bands rfcensus doesn't decode itself (ADS-B 1090, UAT
-978) – they ship as opt-in placeholders if you want to hand off to a
-specialized tool, but the mainstream ADS-B ecosystem (dump1090,
-readsb, tar1090, FlightAware) is what you want for that.
+70cm amateur, ACARS (131), VDL Mode 2, and a few more. The catalogue
+also defines a couple of bands rfcensus doesn't decode itself
+(ADS-B 1090, UAT 978) – they ship as opt-in placeholders if you want
+to hand off to a specialized tool, but the mainstream ADS-B ecosystem
+(dump1090, readsb, tar1090, FlightAware) is what you want for that.
 Override or extend any of this in your `site.toml`.
 
 **Antenna catalogue** (8 antennas) – `whip_generic_small`, `whip_315`,
@@ -389,12 +513,14 @@ You need at least one of the following:
 • HackRF One
 • Anything that speaks to librtlsdr or hackrf tools
 
-You'll also need the underlying decoder binaries installed. The
-easiest path is `./scripts/install_decoders.sh` which handles all of
-this. To install manually:
+You'll also need the underlying decoder binaries installed AND the
+in-tree native libraries (LoRa demodulator, Meshtastic parser)
+compiled for your host. The easiest path is
+`./scripts/install_decoders.sh` which handles all of this. To do it
+manually:
 
 ```bash
-# Debian/Ubuntu
+# Debian/Ubuntu – system decoders
 sudo apt install rtl-433 rtl-sdr multimon-ng
 # Optional for more protocols:
 sudo apt install direwolf
@@ -412,6 +538,11 @@ go install github.com/jstockdale/rtlamr@latest
 
 # hackrf tools if using HackRF:
 sudo apt install hackrf
+
+# In-tree native libraries (built per host to avoid GLIBCXX
+# symbol mismatches; sources ship in the package, binaries do not)
+( cd rfcensus/decoders/_native/lora && make )
+( cd rfcensus/decoders/_native/meshtastic && make )
 ```
 
 Run `rfcensus doctor` and it will tell you what's missing.
@@ -438,10 +569,16 @@ and never leaves your machine.
 Decoders that could in principle transmit (HackRF, hardware that
 supports it) are used in receive mode only.
 
-**Encrypted protocols are identified, not decrypted.** P25 phase 1
-trunk control channels are detected and reported; the encrypted
-voice payload is not. LoRa chirps are detected and characterized;
-the encrypted payload is not. Detection is legal; decryption isn't.
+**Encrypted protocols: identified by default, decrypted only with
+your keys.** P25 phase 1 trunk control channels are detected and
+reported; the encrypted voice payload is not. For Meshtastic, the
+default channel uses a well-known PSK that is shipped with every
+node and published in the Meshtastic source tree – decoding traffic
+on that channel is no different from decoding any unencrypted
+broadcast protocol. For non-default Meshtastic channels, you must
+provide the PSK yourself (`--psk NAME:HEX` on the standalone tool,
+or in `site.toml` for the survey decoder); rfcensus does not attempt
+to break or guess private keys.
 
 **Legally-conservative by default.** The defaults steer you toward
 common ISM and amateur bands plus public-safety identification (not
@@ -475,6 +612,16 @@ Underlying decoder tools have their own licenses (rtl_433 is
 GPL-2.0, rtlamr is AGPL-3.0, multimon-ng is GPL-2.0, etc.). rfcensus
 subprocess-invokes these tools and does not link against them, so
 the BSD license applies to rfcensus itself.
+
+Vendored third-party C code under `rfcensus/decoders/_native/`:
+
+• **tiny-AES-c** (Public Domain / Unlicense) – software AES
+  primitives used by the Meshtastic decoder when mbedtls is
+  unavailable
+• **kissfft** (BSD-3-Clause) – fallback FFT backend for the LoRa
+  demodulator
+• **pffft** (BSD-like, see source) – vectorized FFT backend (SSE on
+  x86, NEON on ARM) for the LoRa demodulator
 
 ## Project
 

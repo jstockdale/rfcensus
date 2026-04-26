@@ -367,3 +367,117 @@ async def _detections_cmd(
             f"{str(r.session_id):<8s} {r.technology:<24s} "
             f"{freq:<14s} {r.confidence:<6.2f} {tools}"
         )
+
+
+@cli.command(name="decodes")
+@click.option("--config", "config_path", type=click.Path(path_type=Path))
+@click.option("--session", "session_id", type=int,
+              help="Limit to one session. Defaults to most recent.")
+@click.option("--protocol", help="Filter by protocol (e.g. meshtastic, tpms).")
+@click.option("--validated-only", is_flag=True,
+              help="Hide decodes the validator rejected.")
+@click.option("--limit", type=int, default=50,
+              help="Max rows to show (default 50; use 0 for all).")
+@click.option("--json", "as_json", is_flag=True)
+def list_decodes(
+    config_path: Path | None,
+    session_id: int | None,
+    protocol: str | None,
+    validated_only: bool,
+    limit: int,
+    as_json: bool,
+) -> None:
+    """Show decoded packets from a session.
+
+    Renders each decode with a per-protocol payload formatter that
+    knows what fields the relevant decoder writes (e.g. for
+    Meshtastic, the from→to arrow, decrypted text preview, channel
+    hash for encrypted packets). Unknown protocols fall back to a
+    generic key=value dump."""
+    run_async(_decodes_cmd(
+        config_path, session_id, protocol, validated_only, limit, as_json,
+    ))
+
+
+async def _decodes_cmd(
+    config_path: Path | None,
+    session_id: int | None,
+    protocol: str | None,
+    validated_only: bool,
+    limit: int,
+    as_json: bool,
+) -> None:
+    from rfcensus.reporting.payload_format import format_payload
+    from rfcensus.storage.repositories import DecodeRepo
+
+    rt = await bootstrap(config_path=config_path, detect=False)
+    sess_repo = SessionRepo(rt.db)
+
+    # Default to the most recent session
+    if session_id is None:
+        recent = await sess_repo.recent(limit=1)
+        if not recent:
+            click.echo("No sessions recorded.")
+            return
+        session_id = recent[0].id
+        if not as_json:
+            click.echo(
+                f"# session {session_id} ({recent[0].command}, "
+                f"started {recent[0].started_at.isoformat()})",
+                err=True,
+            )
+
+    repo = DecodeRepo(rt.db)
+    decodes = await repo.for_session(
+        session_id, validated_only=validated_only,
+    )
+    if protocol:
+        decodes = [d for d in decodes if d.protocol == protocol]
+    if limit > 0:
+        decodes = decodes[-limit:]    # tail; chronological output already
+
+    if as_json:
+        click.echo(json.dumps([
+            {
+                "id": d.id,
+                "session_id": d.session_id,
+                "timestamp": d.timestamp.isoformat(),
+                "decoder": d.decoder,
+                "protocol": d.protocol,
+                "freq_hz": d.freq_hz,
+                "rssi_dbm": d.rssi_dbm,
+                "snr_db": d.snr_db,
+                "validated": d.validated,
+                "decoder_confidence": d.decoder_confidence,
+                "payload": d.payload,
+                "summary": format_payload(d.protocol, d.payload),
+            } for d in decodes
+        ], indent=2, default=str))
+        return
+
+    if not decodes:
+        click.echo(
+            f"No decodes recorded for session {session_id}"
+            + (f" (protocol={protocol})" if protocol else "")
+            + (" (validated only)" if validated_only else "")
+            + "."
+        )
+        return
+
+    # Header — wide column for the formatted summary since that's
+    # where the per-protocol detail lives.
+    click.echo(
+        f"{'time':<19s} {'protocol':<12s} {'freq (MHz)':<11s} "
+        f"{'rssi':<6s} {'V':<2s} summary"
+    )
+    click.echo("─" * 100)
+    for d in decodes:
+        ts = d.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        freq = f"{d.freq_hz/1e6:.3f}"
+        rssi = f"{d.rssi_dbm:.0f}" if d.rssi_dbm is not None else "-"
+        vflag = "✓" if d.validated else " "
+        summary = format_payload(d.protocol, d.payload)
+        click.echo(
+            f"{ts:<19s} {d.protocol:<12s} {freq:<11s} "
+            f"{rssi:<6s} {vflag:<2s} {summary}"
+        )

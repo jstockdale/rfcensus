@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rfcensus"
-version = "0.6.12"
+version = "0.7.14"
 description = "A site survey and inventory tool for the RF environment around you"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -61,6 +61,7 @@ dev = [
 
 [project.scripts]
 rfcensus = "rfcensus.cli:main"
+rfcensus-meshtastic-decode = "rfcensus.tools.decode_meshtastic:main"
 
 [project.urls]
 Homepage = "https://github.com/jstockdale/rfcensus"
@@ -73,6 +74,24 @@ include = ["rfcensus*"]
 [tool.setuptools.package-data]
 "rfcensus.config.builtin" = ["*.toml"]
 "rfcensus.reporting.templates" = ["*.html.j2", "*.txt.j2"]
+# Native LoRa decoder library (built via `make` in the directory).
+# Source is included so users can rebuild for their platform; the .so
+# is included so pip-installed users on the same arch get a working
+# binary out of the box.
+"rfcensus.decoders._native.lora" = [
+    "*.c", "*.h", "*.so", "*.a",
+    "Makefile", "README*",
+]
+# Same for the meshtastic decoder library.
+"rfcensus.decoders._native.meshtastic" = [
+    "Makefile",
+    "src/*.c", "src/*.cpp", "src/*.h",
+    "third_party/tiny-AES-c/*.c",
+    "third_party/tiny-AES-c/*.h",
+    "third_party/tiny-AES-c/LICENSE",
+    "tests/*.cpp",
+    "*.so", "*.a",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

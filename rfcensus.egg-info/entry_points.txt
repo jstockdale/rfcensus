@@ -1,2 +1,3 @@
 [console_scripts]
 rfcensus = rfcensus.cli:main
+rfcensus-meshtastic-decode = rfcensus.tools.decode_meshtastic:main

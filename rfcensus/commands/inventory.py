@@ -70,6 +70,44 @@ def _parse_gain(value: str | None) -> str:
     return str(n)
 
 
+def _synthesize_partial_result(runner) -> "Optional[SessionResult]":
+    """v0.7.6: build a partial SessionResult from a force-cancelled
+    runner so the report builder still has something to render.
+
+    The runner stashes _current_session_id and _current_plan during
+    run() (introduced in v0.7.5 for the TUI snapshot report). When
+    force-quit cancels the runner mid-wave, those stashes survive on
+    the runner object even though run() never returned a SessionResult.
+    We assemble one here from the stashed pieces + the strategy
+    results that did complete.
+
+    Returns None when the cancellation happened before plan build
+    (i.e. nothing to report). The caller handles None gracefully.
+    """
+    from datetime import datetime, timezone
+    from rfcensus.engine.session import SessionResult
+
+    sid = getattr(runner, "_current_session_id", None)
+    plan = getattr(runner, "_current_plan", None)
+    if sid is None or plan is None:
+        return None
+    strategy_results = list(getattr(runner, "_strategy_results", []))
+    started = datetime.now(timezone.utc)    # placeholder; ended is now
+    return SessionResult(
+        session_id=sid,
+        started_at=started,
+        ended_at=datetime.now(timezone.utc),
+        plan=plan,
+        strategy_results=strategy_results,
+        total_decodes=sum(
+            r.decodes_emitted for r in strategy_results
+        ),
+        warnings=list(plan.warnings),
+        # v0.7.4 INCOMPLETE banner triggers on this flag
+        stopped_early=True,
+    )
+
+
 def _build_inventory_cli(
     default_duration: str,
     command_name: str,
@@ -294,6 +332,21 @@ async def _run(
     tui: bool = False,
     no_color: bool = False,
 ) -> None:
+    # v0.6.13: emit a startup banner with the version + mode (tui vs
+    # log) as the very first thing _run does — before any orphan
+    # cleanup or hardware detection. Two reasons:
+    #   1. When users send back a log it's immediately clear which
+    #      build produced it (we've shipped 8 versions in 2 weeks; the
+    #      first question on every bug report is "what version?").
+    #   2. The TUI takes 2-3s to come up after launch. Logging "tui
+    #      mode" up front confirms the user picked the right
+    #      invocation while they wait for the screen to render.
+    from rfcensus import __version__ as _rfcensus_version
+    log.info(
+        "rfcensus %s — launching %s in %s mode",
+        _rfcensus_version, command_name, "tui" if tui else "log",
+    )
+
     # Hard error if user passed --pin to a command that doesn't honor
     # it. Footgun: silently ignoring --pin would mean the user thinks
     # they pinned a dongle and finds out later they didn't. Better to
@@ -715,7 +768,7 @@ async def _run(
         click.echo(
             f"Running {command_name} indefinitely with "
             f"{len(rt.registry.usable())} dongle(s). "
-            f"Ctrl-C to exit cleanly (twice to force).",
+            f"Ctrl-C for clean shutdown + report (twice to force quit).",
             err=True,
         )
         click.echo(
@@ -754,6 +807,14 @@ async def _run(
             # cancel the other. Runner finishing means scan is done;
             # TUI finishing means user hit q (which calls
             # runner.request_stop) or l (log-mode toggle).
+            #
+            # v0.7.6: tell the runner the TUI owns this terminal so
+            # it skips installing its own SIGINT handler. Textual
+            # binds Ctrl+C as a key event and routes it through the
+            # TUI's quit modal — having two handlers fire on the
+            # same keypress was the cause of the "I cancelled the
+            # quit but the wave still wrapped up" bug.
+            runner.tui_active = True
             runner_task = asyncio.create_task(
                 runner.run(), name="rfcensus-runner",
             )
@@ -766,39 +827,201 @@ async def _run(
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            # Cancel the other side cleanly
+            # v0.6.17 / v0.7.4 bug fix: only cancel the OTHER side
+            # when the user actually requested termination AND wants
+            # an immediate force-cancel. Three cases now:
+            #
+            # 1. log_mode_toggle (user pressed `l`): TUI exited, but
+            #    runner should KEEP RUNNING in foreground. Don't cancel.
+            #
+            # 2. graceful_quit (user pressed q+y): TUI exited with
+            #    _stop_requested set. Don't cancel — let the runner
+            #    finish its current wave naturally so leases release
+            #    cleanly and subprocess decoders flush. Without this,
+            #    we orphaned rtl_433 processes mid-wave AND
+            #    runner_task.result() raised CancelledError, swallowing
+            #    the report.
+            #
+            # 3. force_quit (user pressed q+f): cancel the runner now.
+            #    User accepted that the report will be incomplete.
+            #
+            # 4. fast_quit (user pressed Ctrl+Q): cancel runner, skip
+            #    the report render entirely. Panic button — user
+            #    knows they want OUT and doesn't care about the
+            #    partial report. The DB still has the data; user can
+            #    recover via `rfcensus list decodes --session N`.
+            fast_quit = (
+                tui_task in done
+                and getattr(tui_app, "_fast_quit_requested", False)
+            )
+            graceful_quit = (
+                tui_task in done
+                and not fast_quit
+                and getattr(tui_app, "_force_quit_requested", False) is False
+                and (
+                    runner.control.stopped.is_set()
+                    or getattr(runner, "_stop_requested", False)
+                )
+            )
+            log_mode_toggle = (
+                tui_task in done
+                and getattr(tui_app, "_log_mode_requested", False)
+                and not runner.control.stopped.is_set()
+                and not getattr(runner, "_stop_requested", False)
+            )
             for t in pending:
+                if t is runner_task and (log_mode_toggle or graceful_quit):
+                    continue  # leave the runner running / shutting down
                 t.cancel()
                 try:
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
 
+            # v0.7.6: fast-quit short-circuit — print one line and
+            # bail. No report render, no DB query, no JSON. The
+            # user already knows what they did.
+            if fast_quit:
+                sid = getattr(runner, "_current_session_id", None)
+                sid_hint = (
+                    f"\n  Recover partial data with: rfcensus list "
+                    f"decodes --session {sid}"
+                    if sid is not None else ""
+                )
+                click.echo(
+                    f"\n[fast-quit (Ctrl+Q) — runner cancelled, "
+                    f"report skipped]{sid_hint}\n",
+                    err=True,
+                )
+                click.echo("73 🛰️")
+                return
+
             # Get the runner result. If runner crashed, propagate.
             if runner_task in done:
                 result = runner_task.result()
             else:
-                # TUI exited first (q or l). If it was l, we still
-                # need to wait for runner to finish naturally.
-                if not runner.control.stopped.is_set() and not runner._stop_requested:
-                    # Log-mode: just await the runner to completion
+                # TUI exited first (q or l). If it was l OR graceful q,
+                # we still need to wait for runner to finish naturally.
+                if log_mode_toggle:
+                    # v0.6.14: log-mode toggle — re-attach the console
+                    # log handler before awaiting the runner.
+                    #
+                    # Why this is needed: Textual takes over the
+                    # terminal during TUI mode and any RichHandler
+                    # writing to the original sys.stderr ends up
+                    # writing into the live screen buffer (or a torn-
+                    # down handle, depending on Textual version).
+                    # Either way, the handler that was attached at
+                    # CLI entry no longer produces visible output
+                    # after the TUI exits. Reconfiguring logging here
+                    # rebuilds the handler against the now-restored
+                    # stderr, so the user sees real log output for
+                    # the rest of the run.
+                    #
+                    # Going BACK to TUI from log mode would require
+                    # tearing down the handler again and re-running
+                    # tui_app.run_async(); that's a v0.7 feature.
+                    # For now we tell the user how to get back.
+                    from rfcensus.utils.logging import configure_logging
+                    from rfcensus.commands.base import log_path
+                    configure_logging(
+                        level="INFO",
+                        logfile=log_path(),
+                        quiet=False,
+                    )
                     click.echo(
                         "\n[log mode — TUI closed; scan continues "
-                        "in foreground]\n",
+                        "in foreground. Ctrl-C to stop, or quit and "
+                        "relaunch with --tui to return to the dashboard]\n",
                         err=True,
                     )
                     result = await runner_task
+                elif graceful_quit:
+                    # v0.7.4: TUI closed with a graceful-quit request.
+                    # The runner is shutting down on its own — we just
+                    # need to wait for it. Re-attach the console log
+                    # handler so the user sees what's happening (could
+                    # be 30-60s of "finishing band X" messages).
+                    from rfcensus.utils.logging import configure_logging
+                    from rfcensus.commands.base import log_path
+                    configure_logging(
+                        level="INFO",
+                        logfile=log_path(),
+                        quiet=False,
+                    )
+                    click.echo(
+                        "\n[graceful shutdown requested — waiting for "
+                        "current wave to finish so leases release "
+                        "cleanly. Ctrl-C to force immediate exit.]\n",
+                        err=True,
+                    )
+                    try:
+                        result = await runner_task
+                    except asyncio.CancelledError:
+                        # User Ctrl-C'd while waiting — fall through
+                        # with whatever the runner managed to capture
+                        # before being cancelled.
+                        click.echo(
+                            "\n[force-quit during graceful shutdown; "
+                            "report below reflects partial data]\n",
+                            err=True,
+                        )
+                        result = runner_task.result() if not runner_task.cancelled() else None
                 else:
-                    # Quit confirmed: runner is shutting down
-                    result = await runner_task
+                    # Force quit confirmed (q+f): runner was cancelled
+                    # in the loop above; await to surface result/exc.
+                    try:
+                        result = await runner_task
+                    except asyncio.CancelledError:
+                        # v0.7.6: synthesize a partial SessionResult
+                        # from the runner's stashed plan + session id
+                        # + strategy results so the report still
+                        # renders. Previously result=None hit
+                        # ReportBuilder.render(None, ...) →
+                        # AttributeError, which the user experienced
+                        # as "force quit does nothing" because the
+                        # exception fired during Textual teardown
+                        # and was swallowed. Now we render whatever
+                        # made it to the DB with the INCOMPLETE
+                        # banner the v0.7.4 SessionResult gained.
+                        result = _synthesize_partial_result(runner)
+
+            # v0.7.6: result may legitimately be None if the partial
+            # synthesis itself failed (no session_id ever assigned —
+            # runner cancelled before run() got past plan build).
+            # In that case there's nothing to report; tell the user
+            # honestly rather than crashing the report builder.
+            if result is None:
+                click.echo(
+                    "\n[no report — session was cancelled before any "
+                    "tasks executed]\n",
+                    err=True,
+                )
+                click.echo("73 🛰️")
+                return
 
             builder = ReportBuilder(rt.db)
-            report = await builder.render(
-                result,
-                fmt="json" if as_json else "text",
-                include_ids=include_ids,
-                site_name=rt.config.site.name,
-            )
+            try:
+                report = await builder.render(
+                    result,
+                    fmt="json" if as_json else "text",
+                    include_ids=include_ids,
+                    site_name=rt.config.site.name,
+                    command_name=command_name,
+                )
+            except Exception as exc:
+                # v0.7.6: defensive — partial-result rendering can
+                # hit weird states (DB closed mid-write, session row
+                # not flushed yet). Surface it instead of dying.
+                click.echo(
+                    f"\n[report render failed: {exc}]\n"
+                    f"[partial data is in the DB; try "
+                    f"`rfcensus list decodes --session "
+                    f"{getattr(result, 'session_id', '?')}`]\n",
+                    err=True,
+                )
+                click.echo("73 🛰️")
+                return
 
             if output:
                 output.write_text(report, encoding="utf-8")
@@ -817,6 +1040,7 @@ async def _run(
         fmt="json" if as_json else "text",
         include_ids=include_ids,
         site_name=rt.config.site.name,
+        command_name=command_name,
     )
 
     if output:

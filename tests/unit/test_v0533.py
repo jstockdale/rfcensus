@@ -291,15 +291,31 @@ class TestStrategyPopulatesDecoderOptions:
     actually copies band.decoder_options into the spec."""
 
     def test_strategy_copies_band_decoder_options_into_spec(self):
-        """Grep-based test: strategy.py must pass decoder_options
-        when building DecoderRunSpec."""
+        """Grep-based test: strategy.py must reference
+        ``band.decoder_options`` so per-band overrides get into the
+        DecoderRunSpec.
+
+        v0.7.2: the literal one-liner ``decoder_options=dict(
+        band.decoder_options)`` was replaced by a multi-line merge
+        that combines site-level decoder config (e.g. the meshtastic
+        PSK list from site.toml) with band-level overrides — band
+        overrides win on a key-by-key basis. This test was tightened
+        to check the structural invariants instead of an exact
+        textual form."""
         from rfcensus.engine import strategy
         src = inspect.getsource(strategy)
 
-        assert "decoder_options=dict(band.decoder_options)" in src, (
-            "strategy.py must forward band.decoder_options into the "
-            "DecoderRunSpec. dict() wraps the reference so later "
-            "mutation of band doesn't leak into past run specs."
+        # The strategy must read band.decoder_options somewhere
+        assert "band.decoder_options" in src, (
+            "strategy.py must reference band.decoder_options to "
+            "forward per-band overrides into the DecoderRunSpec"
+        )
+
+        # And it must pass a decoder_options kwarg to DecoderRunSpec
+        # (the second test in this class checks that more carefully)
+        assert "decoder_options=" in src, (
+            "strategy.py must pass decoder_options= when building "
+            "the DecoderRunSpec"
         )
 
     def test_decoder_run_spec_instantiation_has_decoder_options_kwarg(self):

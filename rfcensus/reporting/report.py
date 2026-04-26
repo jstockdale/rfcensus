@@ -39,6 +39,7 @@ class ReportBuilder:
         fmt: str = "text",
         include_ids: bool = False,
         site_name: str = "default",
+        command_name: str = "inventory",
     ) -> str:
         emitters = await self.emitter_repo.for_session(result.session_id)
         anomalies = await self.anomaly_repo.for_session(result.session_id)
@@ -62,4 +63,5 @@ class ReportBuilder:
             include_ids=include_ids,
             site_name=site_name,
             previously_known_ids=previously_known_ids,
+            command_name=command_name,
         )

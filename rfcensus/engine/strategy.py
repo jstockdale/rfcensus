@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any
 
 from rfcensus.config.schema import BandConfig, SiteConfig
 from rfcensus.decoders.base import DecoderBase
@@ -56,6 +57,29 @@ class StrategyContext:
 
 
 @dataclass
+class DecoderRunSummary:
+    """v0.6.15: per-decoder breakdown captured inside a StrategyResult.
+
+    Surfaces the data the report currently throws away: exactly which
+    decoder ran, how many decodes it emitted, how it ended, and any
+    errors it reported. Without this, a band shows `decodes=0` and
+    the user can't distinguish:
+
+      • all decoders ran the full duration, band was genuinely silent
+      • one decoder is missing its binary (binary_missing) and the
+        others worked but the band was silent
+      • a decoder crashed mid-run (errors present, ended early)
+
+    These are three different fixes (none / install binary / debug
+    decoder) and the report should make them legible at a glance.
+    """
+    name: str
+    decodes_emitted: int = 0
+    ended_reason: str = ""
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
 class StrategyResult:
     band_id: str
     decoders_run: list[str] = field(default_factory=list)
@@ -68,6 +92,10 @@ class StrategyResult:
     # by _run_decoder_on_band on various exit paths; default is the
     # empty string meaning "completed normally."
     ended_reason: str = ""
+    # v0.6.15: per-decoder breakdown so the report can show WHICH
+    # decoder produced output and WHY each one stopped. See
+    # DecoderRunSummary docstring for the rationale.
+    decoder_runs: list[DecoderRunSummary] = field(default_factory=list)
 
 
 class Strategy(ABC):
@@ -106,6 +134,11 @@ class DecoderOnlyStrategy(Strategy):
             return result
 
         tasks: list[asyncio.Task] = []
+        # v0.6.15: keep parallel list of decoder names so we can
+        # attribute each gathered result back to the decoder that
+        # produced it. Tasks finish in submission order under
+        # asyncio.gather() so the indexes line up.
+        decoder_task_names: list[str] = []
         for decoder in decoders:
             tasks.append(
                 asyncio.create_task(
@@ -114,6 +147,7 @@ class DecoderOnlyStrategy(Strategy):
                 )
             )
             result.decoders_run.append(decoder.name)
+            decoder_task_names.append(decoder.name)
 
         # v0.6.10: passive LoRa-survey piggyback. When this band has a
         # shared rtl_tcp fanout running for its decoders (e.g. 915_ism_
@@ -129,9 +163,24 @@ class DecoderOnlyStrategy(Strategy):
         _maybe_attach_lora_survey(band, ctx, tasks)
 
         decoder_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for dr in decoder_results:
+        for idx, dr in enumerate(decoder_results):
+            # v0.6.15: build per-decoder summary from each result. Only
+            # the first len(decoder_task_names) results are decoder
+            # tasks; anything beyond is the lora_survey sidecar and
+            # gets accounted separately.
+            decoder_name = (
+                decoder_task_names[idx]
+                if idx < len(decoder_task_names) else None
+            )
             if isinstance(dr, Exception):
                 result.errors.append(str(dr))
+                if decoder_name:
+                    result.decoder_runs.append(DecoderRunSummary(
+                        name=decoder_name,
+                        decodes_emitted=0,
+                        ended_reason="error",
+                        errors=[str(dr)],
+                    ))
                 continue
             if dr is None:
                 continue
@@ -146,6 +195,13 @@ class DecoderOnlyStrategy(Strategy):
             if hasattr(dr, "decodes_emitted"):
                 result.decodes_emitted += dr.decodes_emitted
                 result.errors.extend(dr.errors)
+                if decoder_name:
+                    result.decoder_runs.append(DecoderRunSummary(
+                        name=decoder_name,
+                        decodes_emitted=dr.decodes_emitted,
+                        ended_reason=getattr(dr, "ended_reason", "") or "",
+                        errors=list(dr.errors),
+                    ))
             elif hasattr(dr, "detections_emitted"):
                 # LoraSurveyStats: surface errors but don't count
                 # detections as decoder output (they go through the
@@ -208,6 +264,9 @@ class DecoderPrimaryStrategy(Strategy):
         decoders = _pick_decoders(band, ctx, allowed_decoders=allowed_decoders)
 
         tasks: list[asyncio.Task] = []
+        # v0.6.15: parallel name list for per-decoder attribution.
+        # See DecoderOnlyStrategy.execute for rationale.
+        decoder_task_names: list[str] = []
         for decoder in decoders:
             tasks.append(
                 asyncio.create_task(
@@ -216,6 +275,7 @@ class DecoderPrimaryStrategy(Strategy):
                 )
             )
             result.decoders_run.append(decoder.name)
+            decoder_task_names.append(decoder.name)
 
         if band.power_scan_parallel or _should_power_scan(band, ctx):
             # Defer the power-scan sidecar to give decoders first claim
@@ -248,15 +308,37 @@ class DecoderPrimaryStrategy(Strategy):
         _maybe_attach_lora_survey(band, ctx, tasks)
 
         task_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for tr in task_results:
+        for idx, tr in enumerate(task_results):
+            # v0.6.15: per-decoder attribution. Decoder tasks come
+            # first in submission order; sidecars (power_scan,
+            # lora_survey) follow. Use index to look up the decoder
+            # name; out-of-range indexes are sidecars.
+            decoder_name = (
+                decoder_task_names[idx]
+                if idx < len(decoder_task_names) else None
+            )
             if isinstance(tr, Exception):
                 result.errors.append(str(tr))
+                if decoder_name:
+                    result.decoder_runs.append(DecoderRunSummary(
+                        name=decoder_name,
+                        decodes_emitted=0,
+                        ended_reason="error",
+                        errors=[str(tr)],
+                    ))
                 continue
             if tr is None:
                 continue
             if hasattr(tr, "decodes_emitted"):
                 result.decodes_emitted += tr.decodes_emitted
                 result.errors.extend(tr.errors)
+                if decoder_name:
+                    result.decoder_runs.append(DecoderRunSummary(
+                        name=decoder_name,
+                        decodes_emitted=tr.decodes_emitted,
+                        ended_reason=getattr(tr, "ended_reason", "") or "",
+                        errors=list(tr.errors),
+                    ))
             elif hasattr(tr, "detections_emitted"):
                 # LoraSurveyStats: not a decoder, but its errors are
                 # worth surfacing in the strategy result so they end
@@ -340,6 +422,23 @@ def _pick_decoders(
     retry task in a later wave.
     """
     suggested = set(band.suggested_decoders)
+    # v0.7.4: auto-attach decoders. When a site config opts into a
+    # decoder via [decoders.<name>] AND that decoder declares
+    # auto_attach=True, treat it as if it were in every band's
+    # suggested_decoders list. The freq-overlap check below still
+    # gates whether the decoder actually runs on this specific band.
+    #
+    # This closes the UX gap where users set `[decoders.meshtastic]
+    # enabled = true` and got no decoded packets because no band's
+    # suggested_decoders included "meshtastic" — a non-obvious
+    # second config step that defeats the empty-state hint.
+    site_decoders = ctx.config.decoders
+    for dec_name, dec_cfg in site_decoders.items():
+        if not getattr(dec_cfg, "auto_attach", False):
+            continue
+        if not dec_cfg.enabled:
+            continue
+        suggested.add(dec_name)
     chosen: list[DecoderBase] = []
     for name in ctx.decoder_registry.names():
         if suggested and name not in suggested:
@@ -467,6 +566,35 @@ async def _run_decoder_on_band(
     try:
         from rfcensus.decoders.base import DecoderRunSpec
 
+        # Merge site-level decoder config into per-band decoder_options
+        # so the decoder's run() sees both. Per-band overrides win on
+        # a key-by-key basis.
+        #
+        # Why this matters for meshtastic specifically: the PSK list
+        # lives at site level (your channel passphrases don't vary by
+        # band), but the strategy only forwards per-band decoder_options
+        # to the run spec. Without this merge, [decoders.meshtastic] in
+        # site.toml would be silently ignored and only the public
+        # default-channel PSK would be loaded.
+        merged_decoder_options: dict[str, dict[str, Any]] = {}
+        site_decoders = ctx.config.decoders
+        for dec_name, site_dec_cfg in site_decoders.items():
+            # Pull every non-base field (i.e. anything beyond enabled,
+            # binary, extra_args). For typed configs like
+            # MeshtasticDecoderConfig, dump excludes the base fields by
+            # default — we want the typed extras (region, slots, psks)
+            # to flow through as the dict the decoder expects.
+            base_fields = {"enabled", "binary", "extra_args"}
+            extras = {
+                k: v for k, v in site_dec_cfg.model_dump().items()
+                if k not in base_fields
+            }
+            if extras:
+                merged_decoder_options[dec_name] = extras
+        # Per-band overrides override site-level on conflict
+        for dec_name, opts in band.decoder_options.items():
+            merged_decoder_options.setdefault(dec_name, {}).update(opts)
+
         run_spec = DecoderRunSpec(
             lease=lease,
             freq_hz=band.center_hz,
@@ -475,7 +603,7 @@ async def _run_decoder_on_band(
             event_bus=ctx.event_bus,
             session_id=ctx.session_id,
             gain=ctx.gain,
-            decoder_options=dict(band.decoder_options),
+            decoder_options=merged_decoder_options,
         )
         run_started = asyncio.get_event_loop().time()
         result = await decoder.run(run_spec)

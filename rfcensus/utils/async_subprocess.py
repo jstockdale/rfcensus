@@ -86,6 +86,15 @@ class ManagedProcess:
         # Count of stderr lines logged so the caller can tell
         # "subprocess emitted nothing" from "we lost the output."
         self._stderr_lines_logged: int = 0
+        # v0.7.4: ring buffer of the last 20 stderr lines so that
+        # when a subprocess exits non-zero, the caller can attach the
+        # tail to its failure event for post-mortem diagnostics. The
+        # logger writes everything; this buffer just holds enough for
+        # "what did rtl_433 say in its last 5 seconds before exiting
+        # with code 3?" without forcing the user to switch the log
+        # mode and search through hundreds of lines.
+        self._recent_stderr: list[str] = []
+        self._recent_stderr_capacity: int = 20
         # Captured process group ID. We record this at spawn time
         # because once the group leader exits, `os.getpgid(pid)`
         # raises ProcessLookupError — but other members of the
@@ -106,6 +115,13 @@ class ManagedProcess:
         diagnosing "was stderr swallowed?" vs "subprocess was
         silent" when a process fast-exits with 0 decodes."""
         return self._stderr_lines_logged
+
+    @property
+    def recent_stderr(self) -> list[str]:
+        """v0.7.4: snapshot of the last N stderr lines (capped at
+        _recent_stderr_capacity). Useful for surfacing the
+        process's last words in a failure event after exit."""
+        return list(self._recent_stderr)
 
     async def start(self) -> None:
         """Launch the subprocess. Raises BinaryNotFoundError if missing."""
@@ -195,8 +211,17 @@ class ManagedProcess:
                 line = await self._proc.stderr.readline()
                 if not line:
                     break
-                log.log(level, "%s[stderr]: %s", self.config.name, line.decode("utf-8", errors="replace").rstrip())
+                decoded = line.decode("utf-8", errors="replace").rstrip()
+                log.log(level, "%s[stderr]: %s", self.config.name, decoded)
                 self._stderr_lines_logged += 1
+                # v0.7.4: also remember in the ring buffer for forensic
+                # access after exit.
+                self._recent_stderr.append(decoded)
+                if len(self._recent_stderr) > self._recent_stderr_capacity:
+                    del self._recent_stderr[
+                        : len(self._recent_stderr)
+                          - self._recent_stderr_capacity
+                    ]
         except asyncio.CancelledError:
             pass
         except Exception as e:

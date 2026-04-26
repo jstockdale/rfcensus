@@ -169,16 +169,45 @@ class Rtl433Decoder(DecoderBase):
             # decode ran for 74s.
             exit_code = await proc.stop()
             if exit_code is not None and exit_code != 0:
+                # v0.7.4: surface the LAST stderr lines (already
+                # buffered by ManagedProcess) and a human-readable
+                # interpretation of common rtl_433 exit codes so the
+                # log says "rtl_tcp connection lost" instead of just
+                # "exit code 3."
+                interp = _RTL_433_EXIT_CODES.get(
+                    exit_code, "unknown failure"
+                )
+                tail = proc.recent_stderr
+                tail_str = ""
+                if tail:
+                    last = "; ".join(tail[-3:])
+                    tail_str = f" — last stderr: {last}"
                 log.warning(
-                    "rtl_433[%s@%s] exited with code %d "
-                    "(emitted %d decode(s) before exit)",
-                    lease.dongle.id, freq_hz, exit_code,
-                    result.decodes_emitted,
+                    "rtl_433[%s@%s] exited with code %d (%s) "
+                    "(emitted %d decode(s) before exit)%s",
+                    lease.dongle.id, freq_hz, exit_code, interp,
+                    result.decodes_emitted, tail_str,
                 )
                 result.errors.append(
-                    f"rtl_433 exit code {exit_code}"
+                    f"rtl_433 exit code {exit_code} ({interp})"
+                    + tail_str
                 )
         return result
+
+
+# v0.7.4: human-readable interpretations of rtl_433 process exit
+# codes. Pulled from rtl_433/src/rtl_433.c constants — the standard
+# set since v18.x. When rtl_433 prints its own diagnostic to stderr
+# before exiting (it usually does), the recent_stderr buffer carries
+# that text; this map is the fallback when stderr is silent.
+_RTL_433_EXIT_CODES: dict[int, str] = {
+    1: "generic / CLI error",
+    2: "SDR open failed",
+    3: "SDR read failed mid-stream — typically rtl_tcp source "
+       "stalled or USB read returned an error",
+    4: "interrupted (Ctrl-C / SIGINT)",
+    5: "output write failed",
+}
 
 
 def _parse_line(

@@ -99,7 +99,10 @@ class TestTUIPilot:
             app.exit()
 
     async def test_number_key_focuses_slot(self):
-        """Pressing 2 should set focus to slot 2 (index 1)."""
+        """Pressing 2 should set focus to slot 2 (index 1) and swap
+        the main pane to dongle-detail mode. v0.6.14: detail is no
+        longer a pushed Screen; the swap happens via main_pane_mode.
+        """
         from rfcensus.events import HardwareEvent
         from rfcensus.tui.state import reduce
         app = TUIApp(runner=None, no_color=True, site_name="test")
@@ -108,14 +111,18 @@ class TestTUIPilot:
 
         async with app.run_test() as pilot:
             await pilot.pause()
+            assert app.state.main_pane_mode == "events"
             await pilot.press("2")
             await pilot.pause()
-            # Slot 2 → index 1; opens detail screen
+            # Slot 2 → index 1; main pane switches to dongle mode
             assert app.state.focused_dongle_index == 1
-            assert len(app.screen_stack) >= 2  # detail screen pushed
-            # Esc back
+            assert app.state.main_pane_mode == "dongle"
+            # No screen pushed — single-screen architecture
+            assert len(app.screen_stack) == 1
+            # Esc returns to events
             await pilot.press("escape")
             await pilot.pause()
+            assert app.state.main_pane_mode == "events"
             assert len(app.screen_stack) == 1
             app.exit()
 

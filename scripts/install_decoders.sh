@@ -109,12 +109,63 @@ install_rtl_ais() {
     ok "rtl_ais installed"
 }
 
+install_native_libs() {
+    # v0.7.5: build the in-tree native libraries (liblora_demod.so,
+    # libmeshtastic.so). These are pure C/C++ shared libs that the
+    # in-process LoRa + Meshtastic decoders dlopen via ctypes — they
+    # don't ship as .so files in the source tarball because they
+    # need to be compiled against the user's libstdc++ to avoid
+    # GLIBCXX symbol mismatch (the failure mode is dlopen returning
+    # the misleading "No such file or directory" error).
+    say "Building in-tree native libraries (liblora_demod, libmeshtastic)"
+
+    # Find the project root: this script lives in $ROOT/scripts/, so
+    # walk up one level to get to the repo root regardless of where
+    # the user invoked the script from.
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local root="${script_dir%/scripts}"
+    local lora_dir="$root/rfcensus/decoders/_native/lora"
+    local mesh_dir="$root/rfcensus/decoders/_native/meshtastic"
+
+    if [ ! -d "$lora_dir" ] || [ ! -d "$mesh_dir" ]; then
+        echo "  ⚠ native source dirs not found — expected at"
+        echo "    $lora_dir"
+        echo "    $mesh_dir"
+        echo "  Skipping native build. Decoders will fail at runtime."
+        return 1
+    fi
+
+    (
+        cd "$lora_dir"
+        make clean >/dev/null 2>&1 || true
+        if make 2>&1 | tail -5; then
+            ok "liblora_demod.so built"
+        else
+            echo "  ✗ liblora_demod build failed"
+            return 1
+        fi
+    ) || return 1
+
+    (
+        cd "$mesh_dir"
+        make clean >/dev/null 2>&1 || true
+        if make 2>&1 | tail -5; then
+            ok "libmeshtastic.so built"
+        else
+            echo "  ✗ libmeshtastic build failed"
+            return 1
+        fi
+    ) || return 1
+}
+
 main() {
     case "$DISTRO" in
         ubuntu|debian|raspbian|linuxmint)
             install_apt
             install_rtlamr || true
             install_rtl_ais || true
+            install_native_libs || true
             ;;
         *)
             echo "Unsupported distro '$DISTRO'."
@@ -126,6 +177,10 @@ main() {
             echo "  multimon-ng"
             echo "  hackrf (optional, for HackRF support)"
             echo "  direwolf (optional, for APRS decoding)"
+            echo
+            echo "Then build the in-tree native libraries:"
+            echo "  cd rfcensus/decoders/_native/lora && make"
+            echo "  cd rfcensus/decoders/_native/meshtastic && make"
             exit 1
             ;;
     esac

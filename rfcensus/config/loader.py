@@ -21,7 +21,12 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from rfcensus.config.schema import AntennaConfig, BandConfig, SiteConfig
+from rfcensus.config.schema import (
+    AntennaConfig,
+    BandConfig,
+    MeshtasticDecoderConfig,
+    SiteConfig,
+)
 from rfcensus.utils.logging import get_logger
 from rfcensus.utils.paths import site_config_path
 
@@ -123,9 +128,27 @@ def load_config(path: Path | None = None, region: str | None = None) -> SiteConf
     user_raw["antennas"] = [a.model_dump() for a in merged_antennas]
 
     try:
-        return SiteConfig(**user_raw)
+        cfg = SiteConfig(**user_raw)
     except ValidationError as exc:
         raise ConfigError(f"invalid site config at {path}: {exc}") from exc
+
+    # If the user has a [decoders.meshtastic] section, re-validate it
+    # through the typed MeshtasticDecoderConfig so PSK entries get
+    # checked at config-load time (wrong base64 padding, wrong key
+    # length, missing name etc. surface here instead of silently
+    # failing at decode time). The dict-form survived the loose
+    # DecoderConfig pass thanks to extra="allow"; we now upgrade it
+    # in place.
+    mesh_raw = user_raw.get("decoders", {}).get("meshtastic")
+    if mesh_raw is not None:
+        try:
+            cfg.decoders["meshtastic"] = MeshtasticDecoderConfig(**mesh_raw)
+        except ValidationError as exc:
+            raise ConfigError(
+                f"invalid [decoders.meshtastic] config in {path}: {exc}"
+            ) from exc
+
+    return cfg
 
 
 def write_default_site_config(
@@ -200,4 +223,23 @@ default = "decoder_primary"
 # [decoders.rtl_433]
 # enabled = true
 # binary = "/usr/local/bin/rtl_433"
+
+# Meshtastic decoder (in-process LoRa demodulation + AES-CTR decrypt).
+# The public default channel decrypts automatically — no PSKs needed
+# for vanilla mesh traffic. Add entries here only for custom-named
+# channels whose PSK you have (export from the Meshtastic app via
+# share-channel QR; the URL contains a base64-encoded PSK).
+# [decoders.meshtastic]
+# enabled = true
+# region = "US"           # US, EU_868, EU_433, CN, JP, KR, TW, RU, ...
+# slots = "all"           # "all" = every (preset, slot) in passband (recommended);
+#                         # "default" = only each preset's default channel
+#
+# [[decoders.meshtastic.psks]]
+# name = "Bay Area Mesh"
+# psk_b64 = "1PG7OiApB1nwvP+rz05pAQ=="
+#
+# [[decoders.meshtastic.psks]]
+# name = "Family Group"
+# psk_hex = "deadbeefcafebabe..."   # 16 or 32 bytes
 """
