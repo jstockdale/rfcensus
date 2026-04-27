@@ -188,6 +188,21 @@ typedef struct {
 
 void lora_demod_get_stats(const lora_demod_t *d, lora_demod_stats_t *out);
 
+/* v0.7.16: query whether the decoder is currently sitting in the
+ * DETECT state (= idle, looking for a new preamble) or in the middle
+ * of decoding a packet (any of SYNC_NETID / SYNC_DOWN / QUARTER_DOWN
+ * / DEMOD).
+ *
+ * Returns:
+ *   1 — decoder is idle (safe to tear down with no packet loss)
+ *   0 — decoder is actively decoding (tearing down would lose the
+ *       in-flight packet)
+ *
+ * Used by lazy_pipeline to defer reap-while-decoding. The internal
+ * lora_state_t enum stays private; callers only need the binary
+ * idle/busy distinction. */
+int lora_demod_is_idle(const lora_demod_t *d);
+
 #ifdef __cplusplus
 }
 #endif

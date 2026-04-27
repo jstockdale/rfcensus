@@ -1,0 +1,19 @@
+{
+  "source": "user-captured 60s @ 907 MHz, 2.4 Msps, RTL-SDR – LongFast (SF11/250kHz) preset",
+  "sample_rate": 2400000,
+  "center_freq_hz": 907000000,
+  "format": "cu8 (interleaved unsigned 8-bit IQ pairs)",
+  "duration_seconds": 1.5,
+  "preset": "LONG_FAST",
+  "captured_packets": [
+    {
+      "label": "howdy_claude",
+      "fixture_sample_offset": 1790618,
+      "expected_text": "howdy claude",
+      "expected_payload_len": 34,
+      "expected_slot_freq_mhz": 906.875,
+      "expected_min_snr_db": 20.0
+    }
+  ],
+  "notes": "Locks in the SF11 sync-gap fix (constant 128-sample gap, not N/4). With pre-v0.7.16 sync logic, decoder produces 0 packets on this fixture."
+}

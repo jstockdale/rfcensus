@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import numpy as np
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -136,23 +137,28 @@ def _load_library() -> ctypes.CDLL:
     lib.lora_demod_free.restype = None
     lib.lora_demod_free.argtypes = [ctypes.c_void_p]
 
+    # v0.7.15: IQ-data pointers use c_void_p, not POINTER(c_float).
+    # ctypes does ~16µs/call of type-coercion checks for POINTER args
+    # but is essentially free for c_void_p. Callers pass
+    # ``arr.ctypes.data`` (raw int) — semantically identical from
+    # the C function's perspective (it sees a pointer either way).
     lib.lora_demod_process_cf.restype = ctypes.c_int
     lib.lora_demod_process_cf.argtypes = [
         ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_void_p,    # const float *iq
         ctypes.c_size_t,
     ]
     lib.lora_demod_process_cu8.restype = ctypes.c_int
     lib.lora_demod_process_cu8.argtypes = [
         ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_void_p,    # const uint8_t *iq
         ctypes.c_size_t,
     ]
     # v0.7.11: feed_baseband — bypass mix+resamp for shared-channel use
     lib.lora_demod_feed_baseband.restype = ctypes.c_int
     lib.lora_demod_feed_baseband.argtypes = [
         ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_void_p,    # const float *iq
         ctypes.c_size_t,
     ]
     lib.lora_demod_reset.restype = None
@@ -162,6 +168,11 @@ def _load_library() -> ctypes.CDLL:
         ctypes.c_void_p,
         ctypes.POINTER(_CStats),
     ]
+    # v0.7.16: idle-state query for the parent process. See
+    # lora_demod.h for the contract — used by lazy_pipeline to defer
+    # reaping a decoder that's mid-decode.
+    lib.lora_demod_is_idle.restype = ctypes.c_int
+    lib.lora_demod_is_idle.argtypes = [ctypes.c_void_p]
     return lib
 
 
@@ -178,6 +189,24 @@ def _lib_get() -> ctypes.CDLL:
 # ─────────────────────────────────────────────────────────────────────
 # Public Python interface
 # ─────────────────────────────────────────────────────────────────────
+
+def ldro_required(sf: int, bandwidth_hz: int) -> bool:
+    """v0.7.16: per Semtech AN1200.13, LDRO must be enabled when
+    symbol time (= 2^SF / BW) ≥ 16 ms. Catches:
+      • LongSlow      (SF12 / 125 kHz, Tsym = 32.8 ms)
+      • LongModerate  (SF11 / 125 kHz, Tsym = 16.4 ms)
+      • SF12 / 250 kHz (Tsym = 16.4 ms) — Meshtastic doesn't use this
+        but the rule applies if a custom region ever does.
+
+    Important: passing the wrong LDRO value to the C decoder is not
+    a "produces wrong output" condition — it currently SIGILLs the
+    process (a buffer-size assumption in the demod state machine
+    breaks at SF11/125k with LDRO=False). Always use this helper to
+    derive the LDRO flag from the preset; don't hand-roll the test.
+    """
+    symbol_time_ms = (1 << sf) * 1000.0 / bandwidth_hz
+    return symbol_time_ms >= 16.0
+
 
 @dataclass(frozen=True)
 class LoraConfig:
@@ -293,15 +322,19 @@ class LoraDecoder:
         Each sample is 2 bytes: I, Q each as uint8 centered on 127.5.
         Returns the number of complete packets decoded during this call
         (those packets are also queued for ``pop_packets``).
+
+        v0.7.15: ``samples`` is passed as ``c_char_p`` (zero-copy
+        pointer to the bytes buffer). Pre-v0.7.15 this method called
+        ``from_buffer_copy`` which copied the entire input every call.
         """
         if len(samples) % 2 != 0:
             raise ValueError("cu8 stream must be even-length (I/Q pairs)")
         n_samples = len(samples) // 2
         if n_samples == 0:
             return 0
-        buf = (ctypes.c_uint8 * len(samples)).from_buffer_copy(samples)
+        # bytes are immutable, so the pointer is stable for the call.
         return self._lib.lora_demod_process_cu8(
-            self._handle, buf, n_samples
+            self._handle, ctypes.c_char_p(samples), n_samples
         )
 
     def feed_cf(self, samples) -> int:
@@ -310,19 +343,34 @@ class LoraDecoder:
         ``samples`` may be any buffer protocol object (numpy array,
         bytes, array.array). Length is the number of *complex* samples,
         so the underlying buffer must contain 2 × that many floats.
+
+        v0.7.15: zero-copy fast path for numpy complex64 / float32
+        C-contiguous arrays. See :meth:`feed_baseband` for details.
         """
-        # Accept bytes/bytearray directly; for numpy convert via .tobytes()
-        if hasattr(samples, "tobytes"):
-            buf_bytes = samples.tobytes()
-        else:
-            buf_bytes = bytes(samples)
-        n_floats = len(buf_bytes) // 4
-        n_samples = n_floats // 2
+        if isinstance(samples, np.ndarray):
+            if samples.dtype == np.complex64:
+                if not samples.flags["C_CONTIGUOUS"]:
+                    samples = np.ascontiguousarray(samples)
+                n_samples = samples.shape[0]
+            elif samples.dtype == np.float32:
+                if not samples.flags["C_CONTIGUOUS"]:
+                    samples = np.ascontiguousarray(samples)
+                n_samples = samples.shape[0] // 2
+            else:
+                return self.feed_cf(np.frombuffer(
+                    samples.tobytes(), dtype=np.float32))
+            if n_samples == 0:
+                return 0
+            return self._lib.lora_demod_process_cf(
+                self._handle, samples.ctypes.data, n_samples
+            )
+        # Buffer-protocol fallback.
+        arr = np.frombuffer(samples, dtype=np.float32)
+        n_samples = arr.shape[0] // 2
         if n_samples == 0:
             return 0
-        buf = (ctypes.c_float * n_floats).from_buffer_copy(buf_bytes)
         return self._lib.lora_demod_process_cf(
-            self._handle, buf, n_samples
+            self._handle, arr.ctypes.data, n_samples
         )
 
     def feed_baseband(self, samples) -> int:
@@ -336,19 +384,50 @@ class LoraDecoder:
         Used by SharedChannelGroup to fan one channelization out to
         N concurrent SF decoders at the same slot frequency.
 
-        Same input format as ``feed_cf`` (interleaved float32 I/Q).
+        v0.7.15: zero-copy fast path. Three input shapes supported:
+          • ``np.complex64`` 1-D: most common — channelizer output.
+            Memory layout is identical to interleaved float32 I/Q.
+          • ``np.float32`` 1-D with even length: pre-interleaved I/Q.
+          • Any other buffer-protocol object: copies via
+            ``np.frombuffer`` for compatibility.
+
+        Pre-v0.7.15 this method called ``samples.tobytes()`` followed
+        by ``ctypes.c_float * n``.from_buffer_copy(...)`` which made
+        TWO full copies of the samples per call. With the channelizer
+        running at ~250 kHz × complex64 = 2 MB/s sustained per slot,
+        and dozens of active slots, that copy overhead was a
+        meaningful fraction of total CPU per the v0.7.14 profile.
+        Combined with the c_void_p argtype switch (see _ensure_lib),
+        the call dispatch overhead drops from ~1200 µs to ~3 µs for
+        a 50k-complex64 sample buffer.
         """
-        if hasattr(samples, "tobytes"):
-            buf_bytes = samples.tobytes()
-        else:
-            buf_bytes = bytes(samples)
-        n_floats = len(buf_bytes) // 4
-        n_samples = n_floats // 2
+        if isinstance(samples, np.ndarray):
+            if samples.dtype == np.complex64:
+                if not samples.flags["C_CONTIGUOUS"]:
+                    samples = np.ascontiguousarray(samples)
+                n_samples = samples.shape[0]
+            elif samples.dtype == np.float32:
+                if not samples.flags["C_CONTIGUOUS"]:
+                    samples = np.ascontiguousarray(samples)
+                n_samples = samples.shape[0] // 2
+            else:
+                # Wrong dtype — fall back to bytes path.
+                return self.feed_baseband(np.frombuffer(
+                    samples.tobytes(), dtype=np.float32))
+            if n_samples == 0:
+                return 0
+            # samples is alive on the call stack for the duration of
+            # this call, so its data pointer remains valid in C.
+            return self._lib.lora_demod_feed_baseband(
+                self._handle, samples.ctypes.data, n_samples
+            )
+        # Buffer-protocol fallback (bytes / array.array / etc.).
+        arr = np.frombuffer(samples, dtype=np.float32)
+        n_samples = arr.shape[0] // 2
         if n_samples == 0:
             return 0
-        buf = (ctypes.c_float * n_floats).from_buffer_copy(buf_bytes)
         return self._lib.lora_demod_feed_baseband(
-            self._handle, buf, n_samples
+            self._handle, arr.ctypes.data, n_samples
         )
 
     def reset(self) -> None:
@@ -379,6 +458,13 @@ class LoraDecoder:
             detect_max_run=s.detect_max_run,
             detect_peak_mag_max=s.detect_peak_mag_max,
         )
+
+    def is_idle(self) -> bool:
+        """v0.7.16: True if the decoder is in DETECT (not currently
+        decoding a packet). Used by lazy_pipeline to defer reaping a
+        decoder that has a packet in flight — tearing it down would
+        lose the in-flight payload. Cheap (one ctypes int return)."""
+        return bool(self._lib.lora_demod_is_idle(self._handle))
 
     # ── Internal callback ───────────────────────────────────────────
 

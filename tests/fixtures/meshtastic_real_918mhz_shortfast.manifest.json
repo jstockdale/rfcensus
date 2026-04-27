@@ -1,0 +1,19 @@
+{
+  "source": "user-captured 40s @ 918 MHz, 2.4 Msps, RTL-SDR – ShortFast (SF7/250kHz) preset",
+  "sample_rate": 2400000,
+  "center_freq_hz": 918000000,
+  "format": "cu8 (interleaved unsigned 8-bit IQ pairs)",
+  "duration_seconds": 1.0,
+  "preset": "SHORT_FAST",
+  "captured_packets": [
+    {
+      "label": "hi_claude",
+      "fixture_sample_offset": 720058,
+      "expected_text": "hi claude",
+      "expected_payload_len": 31,
+      "expected_slot_freq_mhz": 918.875,
+      "expected_min_snr_db": 10.0
+    }
+  ],
+  "notes": "Covers the SF7/BW=250kHz path (smallest LoRa configuration: N=128, 4ms preamble). Important regression coverage because SF7 has only 21dB processing gain vs SF12's 36dB, so probe SNR thresholds and detector timing margins are tightest here."
+}

@@ -1,0 +1,19 @@
+{
+  "source": "user-captured 60s @ 903 MHz, 2.4 Msps, RTL-SDR – LongModerate (SF11/125kHz) preset",
+  "sample_rate": 2400000,
+  "center_freq_hz": 903000000,
+  "format": "cu8 (interleaved unsigned 8-bit IQ pairs)",
+  "duration_seconds": 3.0,
+  "preset": "LONG_MODERATE",
+  "captured_packets": [
+    {
+      "label": "this_is_a_test",
+      "fixture_sample_offset": 1201460,
+      "expected_text": "this is a test",
+      "expected_payload_len": 36,
+      "expected_slot_freq_mhz": 902.688,
+      "expected_min_snr_db": 25.0
+    }
+  ],
+  "notes": "Locks in the LDRO logic: SF11 + BW=125kHz has Tsym=16.4ms which crosses the 16ms LDRO threshold. With pre-v0.7.16 LDRO logic (sf==12 only), constructing a decoder for this preset and feeding it real samples triggers a SIGILL in the codec. Window is 3s wide because at SF11/125kHz a packet plus any false-positive-preamble timeouts need ~2s headroom to complete."
+}

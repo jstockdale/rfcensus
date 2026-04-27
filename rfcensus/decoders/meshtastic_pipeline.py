@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Iterator, Optional
 
 from rfcensus.decoders.lora_native import (
-    LoraConfig, LoraDecoder, LoraPacket, LoraStats,
+    LoraConfig, LoraDecoder, LoraPacket, LoraStats, ldro_required as _ldro_required,
 )
 from rfcensus.decoders.meshtastic_native import (
     DecodedPacket, MeshtasticDecoder,
@@ -98,12 +98,13 @@ class MultiPresetPipeline:
                 sf=slot.preset.sf,
                 sync_word=_MESHTASTIC_SYNC_WORD,
                 mix_freq_hz=mix_freq,
-                # Meshtastic enables LDRO automatically when symbol
-                # time exceeds 16ms. SF12 + BW=125 is the only preset
-                # that crosses that threshold (LongSlow). The decoder
-                # follows what the explicit-header reports, but we
-                # still need the right sf_app at sync time.
-                ldro=(slot.preset.sf == 12 and slot.preset.bandwidth_hz <= 125_000),
+                # v0.7.16: per Semtech AN1200.13, LDRO required when
+                # symbol time ≥ 16 ms. The previous test missed
+                # LongModerate (SF11/125k, Tsym = 16.4 ms), which
+                # SIGILLs the decoder. The helper covers all such
+                # combinations correctly — including hypothetical
+                # custom regions that use SF12 at 250 kHz.
+                ldro=_ldro_required(slot.preset.sf, slot.preset.bandwidth_hz),
             )
             self._decoders.append((slot, LoraDecoder(cfg)))
 

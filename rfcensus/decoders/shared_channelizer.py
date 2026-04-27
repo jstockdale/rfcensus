@@ -34,20 +34,23 @@ def _ensure_bindings() -> ctypes.CDLL:
         ctypes.c_int32,     # mix_freq_hz
     ]
     lib.lora_channelizer_free.argtypes = [ctypes.c_void_p]
+    # v0.7.15: use c_void_p instead of POINTER(...) for IQ pointers.
+    # Drops ~16 µs/call of ctypes coercion overhead per pointer arg.
+    # See lora_native._ensure_lib for full discussion.
     lib.lora_channelizer_feed_cu8.restype = ctypes.c_size_t
     lib.lora_channelizer_feed_cu8.argtypes = [
         ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_uint8),
+        ctypes.c_void_p,    # const uint8_t *cu8
         ctypes.c_size_t,
-        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_void_p,    # float *out
         ctypes.c_size_t,
     ]
     lib.lora_channelizer_feed_cf.restype = ctypes.c_size_t
     lib.lora_channelizer_feed_cf.argtypes = [
         ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_void_p,    # const float *cf
         ctypes.c_size_t,
-        ctypes.POINTER(ctypes.c_float),
+        ctypes.c_void_p,    # float *out
         ctypes.c_size_t,
     ]
     lib.lora_channelizer_samples_in.restype = ctypes.c_uint64
@@ -99,6 +102,7 @@ class SharedChannelizer:
         self._decim_ratio = sample_rate_hz / bandwidth_hz
         self._out_buf_capacity = 0
         self._out_buf = None    # type: ignore
+        self._out_buf_addr = 0  # cached ctypes.addressof(_out_buf)
 
     def _ensure_out_buf(self, n_in: int) -> None:
         # +16 padding for the +1 ceiling slop the resampler can produce
@@ -110,6 +114,10 @@ class SharedChannelizer:
                 cap *= 2
             self._out_buf_capacity = cap
             self._out_buf = (ctypes.c_float * (cap * 2))()
+            # v0.7.15: cache the buffer's address as a raw int so we
+            # can pass it as c_void_p (zero per-call ctypes overhead)
+            # instead of paying ~16µs/call for POINTER coercion.
+            self._out_buf_addr = ctypes.addressof(self._out_buf)
 
     def feed_cu8(self, cu8: bytes) -> np.ndarray:
         """Feed cu8 bytes; return baseband float-pairs as a numpy
@@ -118,22 +126,33 @@ class SharedChannelizer:
         The returned array is a copy backed by Python memory and
         safe to pass to ``LoraDecoder.feed_baseband()`` (or to the
         BlindProbe).
+
+        v0.7.15: zero-copy input. Pre-v0.7.15 this method called
+        ``(ctypes.c_uint8 * len(cu8)).from_buffer_copy(cu8)`` which
+        copied the entire input every call. With per-chunk inputs
+        of ~10s of KB at 2.4 MS/s, that copy was meaningful CPU.
+        ``c_char_p(cu8)`` is a zero-copy borrow of the bytes buffer
+        (bytes are immutable so the pointer is stable for the life
+        of the bytes object — i.e. for the duration of this call).
         """
         n_in = len(cu8) // 2
         if n_in == 0:
             return np.zeros(0, dtype=np.complex64)
         self._ensure_out_buf(n_in)
-        in_buf = (ctypes.c_uint8 * len(cu8)).from_buffer_copy(cu8)
+
         lib = _ensure_bindings()
+        # v0.7.15: c_char_p(cu8) is a zero-copy pointer to the bytes
+        # buffer. self._out_buf_addr is a cached int address.
         n_out = lib.lora_channelizer_feed_cu8(
             self._handle,
-            in_buf, n_in,
-            self._out_buf, self._out_buf_capacity,
+            ctypes.c_char_p(cu8), n_in,
+            self._out_buf_addr, self._out_buf_capacity,
         )
         if n_out == 0:
             return np.zeros(0, dtype=np.complex64)
         # Build numpy view of the C buffer's used prefix and copy out.
-        # ctypes -> numpy via frombuffer; reshape pairs to complex64.
+        # The .copy() IS necessary here: self._out_buf is reused by
+        # the next call, so a view would dangle.
         flat = np.frombuffer(self._out_buf, dtype=np.float32,
                               count=2 * n_out)
         # Interleaved float -> complex64
@@ -142,24 +161,55 @@ class SharedChannelizer:
     def feed_cf(self, samples) -> np.ndarray:
         """Feed already-converted float samples (interleaved I/Q).
 
-        ``samples`` may be a numpy float32 array, bytes, or any
-        buffer-protocol object containing 2N floats.
+        ``samples`` may be a numpy float32/complex64 array, bytes, or
+        any buffer-protocol object containing 2N floats.
+
+        v0.7.15: zero-copy when ``samples`` is a numpy complex64 or
+        float32 C-contiguous array (the common case).
         """
-        if hasattr(samples, "tobytes"):
-            buf_bytes = samples.tobytes()
-        else:
-            buf_bytes = bytes(samples)
-        n_floats = len(buf_bytes) // 4
-        n_in = n_floats // 2
+        if isinstance(samples, np.ndarray):
+            if samples.dtype == np.complex64:
+                if not samples.flags["C_CONTIGUOUS"]:
+                    samples = np.ascontiguousarray(samples)
+                n_in = samples.shape[0]
+            elif samples.dtype == np.float32:
+                if not samples.flags["C_CONTIGUOUS"]:
+                    samples = np.ascontiguousarray(samples)
+                n_in = samples.shape[0] // 2
+            else:
+                # Wrong dtype — fall back to bytes path.
+                samples = samples.tobytes()
+                n_in = len(samples) // 8
+            if isinstance(samples, np.ndarray):
+                if n_in == 0:
+                    return np.zeros(0, dtype=np.complex64)
+                self._ensure_out_buf(n_in)
+                in_addr = samples.ctypes.data
+                lib = _ensure_bindings()
+                n_out = lib.lora_channelizer_feed_cf(
+                    self._handle,
+                    in_addr, n_in,
+                    self._out_buf_addr, self._out_buf_capacity,
+                )
+                if n_out == 0:
+                    return np.zeros(0, dtype=np.complex64)
+                flat = np.frombuffer(self._out_buf, dtype=np.float32,
+                                      count=2 * n_out)
+                return flat.view(np.complex64).copy()
+
+        # Bytes / array.array / other buffer-protocol objects.
+        # c_char_p borrows the pointer (zero copy).
+        if not isinstance(samples, (bytes, bytearray)):
+            samples = bytes(samples)
+        n_in = len(samples) // 8
         if n_in == 0:
             return np.zeros(0, dtype=np.complex64)
         self._ensure_out_buf(n_in)
-        in_buf = (ctypes.c_float * n_floats).from_buffer_copy(buf_bytes)
         lib = _ensure_bindings()
         n_out = lib.lora_channelizer_feed_cf(
             self._handle,
-            in_buf, n_in,
-            self._out_buf, self._out_buf_capacity,
+            ctypes.c_char_p(samples), n_in,
+            self._out_buf_addr, self._out_buf_capacity,
         )
         if n_out == 0:
             return np.zeros(0, dtype=np.complex64)

@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-__version__ = "0.7.14"
+__version__ = "0.7.16"
 __author__ = "John Stockdale"
 __license__ = "BSD-3-Clause"

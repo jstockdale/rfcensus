@@ -60,11 +60,14 @@ def _ensure_bindings() -> ctypes.CDLL:
     ]
     lib.lora_probe_destroy.argtypes = [ctypes.c_void_p]
     lib.lora_probe_scan.restype = ctypes.c_uint32
+    # v0.7.15: c_void_p instead of POINTER(...) for the pointer args
+    # — saves ~3 µs/call of ctypes type-coercion overhead. Same
+    # pattern as the channelizer + decoder ctypes wrappers.
     lib.lora_probe_scan.argtypes = [
-        ctypes.c_void_p,
-        ctypes.POINTER(_FftCpx),
-        ctypes.c_uint32,
-        ctypes.POINTER(_ProbeResult),
+        ctypes.c_void_p,    # probe handle
+        ctypes.c_void_p,    # const cf_t *iq
+        ctypes.c_uint32,    # n_samples
+        ctypes.c_void_p,    # ProbeResult *out
     ]
     _bindings_done = True
     return lib
@@ -139,6 +142,8 @@ class BlindProbe:
             )
         # Pre-allocate result buffer to avoid per-call alloc.
         self._results = (_ProbeResult * len(sfs))()
+        # v0.7.15: cache the address as an int for fast c_void_p pass.
+        self._results_addr = ctypes.addressof(self._results)
         # Compute the largest N (SF11 oversample=2 = 4096). The probe
         # needs at least max_N samples to be able to test all SFs.
         self._max_N = max(((1 << sf) * oversample) for sf in sfs)
@@ -160,21 +165,14 @@ class BlindProbe:
         Returns one ProbeResult per candidate SF, in the order
         passed at construction time. ``detected=True`` indicates the
         SNR exceeded the threshold.
+
+        v0.7.15 perf note: this call wraps each result in a Python
+        ``ProbeResult`` dataclass for backward compatibility. Hot
+        callers (lazy_pipeline.py) should prefer :meth:`scan_inplace`
+        which returns the raw C struct array (no allocation, no
+        dataclass overhead). For 6 SFs that's ~6 µs/call saved.
         """
-        if baseband.dtype != np.complex64:
-            baseband = baseband.astype(np.complex64)
-        if baseband.ndim != 1:
-            raise ValueError(f"baseband must be 1-D, got {baseband.shape}")
-        n = len(baseband)
-        # Ensure C-contiguous for ctypes view
-        if not baseband.flags["C_CONTIGUOUS"]:
-            baseband = np.ascontiguousarray(baseband)
-        # complex64 has the SAME memory layout as our _FftCpx struct
-        # (two adjacent floats, real then imag). Cast the underlying
-        # buffer pointer.
-        ptr = baseband.ctypes.data_as(ctypes.POINTER(_FftCpx))
-        lib = _ensure_bindings()
-        lib.lora_probe_scan(self._handle, ptr, n, self._results)
+        self._scan_into_results(baseband)
         return [
             ProbeResult(
                 sf=r.sf,
@@ -186,6 +184,51 @@ class BlindProbe:
             )
             for r in self._results
         ]
+
+    def scan_inplace(self, baseband: np.ndarray):
+        """v0.7.15: zero-allocation fast-path scan.
+
+        Identical to :meth:`scan` but returns the in-place ctypes
+        results array (with .sf / .snr_db / .peak_bin / .detected /
+        .peak_mag / .noise_floor fields readable directly). The
+        returned object is a view into the probe's internal buffer
+        — its contents are OVERWRITTEN by the next scan_inplace or
+        scan call on this probe.
+
+        Saves the ~6 µs/call dataclass-construction cost paid by
+        :meth:`scan`. Use in hot loops; otherwise use :meth:`scan`.
+        """
+        self._scan_into_results(baseband)
+        # The ctypes array is iterable — yields each Structure with
+        # the field accessors. Caller can do ``for r in scan_inplace(bb):``.
+        return self._results
+
+    def _scan_into_results(self, baseband: np.ndarray) -> int:
+        """Inner: run the C scan into self._results. Returns the
+        number of SFs the C side marked as detected (== sum of
+        results[i].detected). Callers that need ALL results should
+        iterate ``self._results`` directly; this return value is a
+        convenience for "anything detected?" queries.
+
+        v0.7.15: zero-copy ctypes path. Replaces ``data_as(POINTER)``
+        with a raw int (.ctypes.data) + c_void_p argtype, saving
+        ~3 µs/call of ctypes coercion overhead.
+        """
+        if baseband.dtype != np.complex64:
+            baseband = baseband.astype(np.complex64)
+        if baseband.ndim != 1:
+            raise ValueError(f"baseband must be 1-D, got {baseband.shape}")
+        n = len(baseband)
+        if not baseband.flags["C_CONTIGUOUS"]:
+            baseband = np.ascontiguousarray(baseband)
+        lib = _ensure_bindings()
+        # baseband.ctypes.data is the raw int address of the array's
+        # data buffer; passes through as c_void_p (per the v0.7.15
+        # argtype switch above). self._results_addr is cached from
+        # __init__.
+        return lib.lora_probe_scan(
+            self._handle, baseband.ctypes.data, n, self._results_addr
+        )
 
     def detected_sfs(self, baseband: np.ndarray) -> list[int]:
         """Convenience: return list of SFs above threshold."""

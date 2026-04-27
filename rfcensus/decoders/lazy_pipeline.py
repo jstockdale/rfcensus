@@ -34,7 +34,7 @@ from typing import Iterator, Optional
 import numpy as np    # v0.7.11: needed for shared-channelizer fanout buffers
 
 from rfcensus.decoders.lora_native import (
-    LoraConfig, LoraDecoder, LoraStats,
+    LoraConfig, LoraDecoder, LoraStats, ldro_required,
 )
 from rfcensus.decoders.meshtastic_native import MeshtasticDecoder
 from rfcensus.decoders.meshtastic_pipeline import PipelinePacket
@@ -52,6 +52,10 @@ from rfcensus.utils.meshtastic_region import (
 
 # Sync word for all Meshtastic presets.
 _MESHTASTIC_SYNC_WORD = 0x2B
+
+# v0.7.16: re-export so all 4 in-file LDRO sites can use the single
+# source of truth from lora_native (cross-pipeline consistency).
+_ldro_required = ldro_required
 
 
 @dataclass
@@ -157,6 +161,19 @@ class _ActiveSlot:
     probe_rate_ewma: float = 0.0
     probe_history_count: int = 0
     pinned: bool = False
+    # v0.7.16: reap-while-decoding deferral. When `_maybe_periodic_probe`
+    # decides reap conditions are met (idle past reap_after_ms), it
+    # checks decoder.is_idle() for every active decoder. If ANY decoder
+    # is mid-decode (sync/downchirp/demod), reap is deferred — the
+    # decoder is still pulling out a packet and tearing it down would
+    # lose the in-flight payload. We set `wants_reap_at_offset` to the
+    # current offset; subsequent probe ticks re-check decoder idle and
+    # reap once all are clear. To protect against a hung decoder
+    # (shouldn't happen, but defensive), if wants_reap is set for
+    # longer than `reap_force_after_samples`, we force reap and bump
+    # a counter so the user sees it in the summary.
+    wants_reap_at_offset: int = 0     # 0 = not pending; >0 = pending since
+    reap_deferrals: int = 0           # count of times we deferred (diagnostic)
 
 
 @dataclass
@@ -223,6 +240,16 @@ class LazyPipelineStats:
     pin_events: int = 0
     unpin_events: int = 0
     reap_skipped_pinned: int = 0
+    # v0.7.16: reap-while-decoding deferral counters. reap_deferred_busy
+    # counts ticks where reap was deferred because a decoder was mid-
+    # decode (sync/payload). reap_force_after_hung counts the rare case
+    # where we forced a reap because the decoder was busy past the hung
+    # threshold — should normally be zero. reap_completed_after_defer
+    # is the happy path: deferred reap that succeeded once the decoder
+    # transitioned back to idle.
+    reap_deferred_busy: int = 0
+    reap_completed_after_defer: int = 0
+    reap_force_after_hung: int = 0
 
 
 class LazyMultiPresetPipeline:
@@ -269,6 +296,22 @@ class LazyMultiPresetPipeline:
         use_periodic_probe: bool = True,
         probe_interval_ms: float = 10.0,
         reap_after_ms: float = 100.0,
+        # v0.7.16: hung-decoder reap timeout. Once we've decided to
+        # reap (probe silent past reap_after_ms) but the decoder is
+        # mid-decode, we defer the reap and keep checking on every
+        # subsequent probe tick. If the deferral persists past
+        # reap_force_after_ms (default 5 seconds), we force the reap
+        # — assumes the decoder is hung and prefers losing one packet
+        # over leaking the slot forever.
+        #
+        # 5 seconds covers the longest legitimate Meshtastic packet
+        # (LongSlow 237-byte payload at SF12/BW125 with full preamble
+        # + sync + header + CRC = ~3.0s) with margin. The C decoder
+        # itself can't truly hang — bad signal causes garbage symbols
+        # which complete the symbol count and trip CRC fail, returning
+        # to DETECT — so this is a paranoia-only safety net. Should
+        # report 0 force-reap events on any normal capture.
+        reap_force_after_ms: float = 5000.0,
         # v0.7.13 commit 1c: hot-slot pin via probe-positive rate.
         # Track recent probe-positive rate over a rolling window.
         # If the rate exceeds pin_high_pct, the slot becomes pinned
@@ -423,6 +466,10 @@ class LazyMultiPresetPipeline:
         )
         self._reap_after_samples = int(
             sample_rate_hz * reap_after_ms / 1000.0
+        )
+        # v0.7.16: hung-decoder force-reap timer.
+        self._reap_force_after_samples = int(
+            sample_rate_hz * reap_force_after_ms / 1000.0
         )
         # v0.7.13 commit 1c: pin config. We store thresholds as
         # FRACTIONS (not %) to avoid repeated divides during the
@@ -706,12 +753,13 @@ class LazyMultiPresetPipeline:
                         if self._use_periodic_probe:
                             self._append_probe_baseband(active, baseband)
                         if active.decoders:
-                            floats = np.empty(2 * len(baseband),
-                                               dtype=np.float32)
-                            floats[0::2] = baseband.real
-                            floats[1::2] = baseband.imag
+                            # v0.7.15: pass complex64 directly. Memory
+                            # layout is identical to interleaved float32
+                            # I/Q so the C decoder reads the same bytes;
+                            # we save an alloc + two strided copies + a
+                            # tobytes() + a from_buffer_copy() per call.
                             for dec in active.decoders.values():
-                                dec.feed_baseband(floats)
+                                dec.feed_baseband(baseband)
                 else:
                     # Legacy v0.7.x path: each decoder mix+resamps.
                     # No probe-buffer in this path; periodic probe
@@ -1057,10 +1105,17 @@ class LazyMultiPresetPipeline:
                         if start < 0:
                             break
                         window = lookback_baseband[start:end]
-                        for r in probe.scan(window):
+                        # v0.7.15: scan_inplace returns the raw ctypes
+                        # struct array (no dataclass wrapping). Field
+                        # access is identical to ProbeResult.
+                        for r in probe.scan_inplace(window):
                             cur_best = best_per_sf.get(r.sf)
-                            if cur_best is None or r.snr_db > cur_best.snr_db:
-                                best_per_sf[r.sf] = r
+                            # cur_best is (sf, snr_db, detected) or None
+                            if cur_best is None or r.snr_db > cur_best[1]:
+                                # Snapshot fields we need now — the C
+                                # buffer will be overwritten on the
+                                # next scan_inplace call.
+                                best_per_sf[r.sf] = (r.sf, r.snr_db, r.detected)
 
                     # Decision per SF: in-FFT SNR ≥ threshold → detected.
                     # Real LoRa preambles produce in-FFT SNR of +25 to
@@ -1074,8 +1129,10 @@ class LazyMultiPresetPipeline:
                     # scaling made it net-negative on real captures.
                     # Removed.
                     detected_sfs: set[int] = set()
-                    for sf, r in best_per_sf.items():
-                        if r.snr_db >= self._probe_snr_threshold_db:
+                    # v0.7.15: best_per_sf values are now (sf, snr_db,
+                    # detected) tuples rather than ProbeResult instances.
+                    for sf, (_, snr_db, _) in best_per_sf.items():
+                        if snr_db >= self._probe_snr_threshold_db:
                             detected_sfs.add(sf)
 
                     if detected_sfs:
@@ -1161,8 +1218,7 @@ class LazyMultiPresetPipeline:
                     sf=slot.preset.sf,
                     sync_word=_MESHTASTIC_SYNC_WORD,
                     mix_freq_hz=0,
-                    ldro=(slot.preset.sf == 12
-                          and slot.preset.bandwidth_hz <= 125_000),
+                    ldro=_ldro_required(slot.preset.sf, slot.preset.bandwidth_hz),
                 )
             else:
                 # Legacy v0.7.x path: per-decoder mix+resamp from cu8.
@@ -1172,8 +1228,7 @@ class LazyMultiPresetPipeline:
                     sf=slot.preset.sf,
                     sync_word=_MESHTASTIC_SYNC_WORD,
                     mix_freq_hz=mix_freq,
-                    ldro=(slot.preset.sf == 12
-                          and slot.preset.bandwidth_hz <= 125_000),
+                    ldro=_ldro_required(slot.preset.sf, slot.preset.bandwidth_hz),
                 )
             dec = LoraDecoder(cfg)
             active.decoders[slot.preset.key] = dec
@@ -1188,11 +1243,10 @@ class LazyMultiPresetPipeline:
             return
         if use_sharing and lookback_baseband is not None and len(lookback_baseband) > 0:
             # Already-channelized — fan out to all decoders.
-            floats = np.empty(2 * len(lookback_baseband), dtype=np.float32)
-            floats[0::2] = lookback_baseband.real
-            floats[1::2] = lookback_baseband.imag
+            # v0.7.15: pass complex64 directly (see comment at the
+            # main feed path).
             for dec in active.decoders.values():
-                dec.feed_baseband(floats)
+                dec.feed_baseband(lookback_baseband)
         elif actual_lookback > 0:
             # Legacy path: each decoder does its own mix+resamp.
             lookback_iq = self._ring.read(lookback_start, actual_lookback)
@@ -1243,8 +1297,7 @@ class LazyMultiPresetPipeline:
                 sf=slot.preset.sf,
                 sync_word=_MESHTASTIC_SYNC_WORD,
                 mix_freq_hz=0,
-                ldro=(slot.preset.sf == 12
-                      and slot.preset.bandwidth_hz <= 125_000),
+                ldro=_ldro_required(slot.preset.sf, slot.preset.bandwidth_hz),
             )
         else:
             cfg = LoraConfig(
@@ -1253,8 +1306,7 @@ class LazyMultiPresetPipeline:
                 sf=slot.preset.sf,
                 sync_word=_MESHTASTIC_SYNC_WORD,
                 mix_freq_hz=mix_freq,
-                ldro=(slot.preset.sf == 12
-                      and slot.preset.bandwidth_hz <= 125_000),
+                ldro=_ldro_required(slot.preset.sf, slot.preset.bandwidth_hz),
             )
         dec = LoraDecoder(cfg)
         active.decoders[slot.preset.key] = dec
@@ -1393,7 +1445,9 @@ class LazyMultiPresetPipeline:
             start = end - min_n
             if start < 0:
                 break
-            for r in active.probe.scan(bb[start:end]):
+            # v0.7.15: scan_inplace avoids dataclass alloc in this
+            # hot loop (called every chunk, every active slot).
+            for r in active.probe.scan_inplace(bb[start:end]):
                 if r.detected:
                     detected_sfs.add(r.sf)
 
@@ -1406,6 +1460,11 @@ class LazyMultiPresetPipeline:
         if detected_sfs:
             self._stats.periodic_probe_positive += 1
             active.last_positive_probe_offset = chunk_end_offset
+            # v0.7.16: probe firing positive means new traffic — even
+            # if we'd been wanting to reap, the slot is alive again.
+            # Reset the deferral so the timeout clock doesn't keep
+            # ticking on a slot that's no longer idle.
+            active.wants_reap_at_offset = 0
             if active.state == "reaped":
                 # Re-spawn decoders for the detected SFs (plus any
                 # confirmed (slot, sf) presets per commit 1b). The
@@ -1429,8 +1488,41 @@ class LazyMultiPresetPipeline:
             self._stats.reap_skipped_pinned += 1
             return
         idle_for = chunk_end_offset - active.last_positive_probe_offset
-        if idle_for >= self._reap_after_samples:
-            self._periodic_reap(active, chunk_end_offset)
+        if idle_for < self._reap_after_samples:
+            return
+
+        # v0.7.16: idle period crossed — but check decoder.is_idle()
+        # before tearing down. The probe runs every 10 ms and looks
+        # for PREAMBLES; during a long-packet payload (e.g. SF11/250k
+        # ~500 ms) there ARE no preambles, so the probe goes silent
+        # and crosses reap_after even though a decoder is actively
+        # pulling out the packet. Tearing down here would drop the
+        # in-flight payload. Defer reap until all decoders are idle
+        # (or until the hung-timeout fires).
+        any_busy = any(
+            not dec.is_idle() for dec in active.decoders.values()
+        )
+        if any_busy:
+            if active.wants_reap_at_offset == 0:
+                # First defer for this reap cycle — record when.
+                active.wants_reap_at_offset = chunk_end_offset
+            active.reap_deferrals += 1
+            self._stats.reap_deferred_busy += 1
+            # Hung-decoder safety: if we've been wanting to reap for
+            # too long, force it. Should be 0 in normal operation.
+            wanted_for = chunk_end_offset - active.wants_reap_at_offset
+            if wanted_for >= self._reap_force_after_samples:
+                self._stats.reap_force_after_hung += 1
+                self._periodic_reap(active, chunk_end_offset)
+                active.wants_reap_at_offset = 0
+            return
+
+        # All decoders idle. If we had been deferring, count the
+        # successful late-reap (= the system worked as intended).
+        if active.wants_reap_at_offset != 0:
+            self._stats.reap_completed_after_defer += 1
+            active.wants_reap_at_offset = 0
+        self._periodic_reap(active, chunk_end_offset)
 
     def _periodic_reap(
         self, active: _ActiveSlot, chunk_end_offset: int,
@@ -1514,11 +1606,9 @@ class LazyMultiPresetPipeline:
         # _handle_activate's lookback feed.
         bb = active.probe_baseband
         if bb is not None and len(bb) > 0:
-            floats = np.empty(2 * len(bb), dtype=np.float32)
-            floats[0::2] = bb.real
-            floats[1::2] = bb.imag
+            # v0.7.15: pass complex64 directly.
             for dec in active.decoders.values():
-                dec.feed_baseband(floats)
+                dec.feed_baseband(bb)
         active.state = "spawned"
         self._stats.periodic_respawns += 1
 

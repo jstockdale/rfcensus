@@ -42,6 +42,7 @@ rfcensus/decoders/lora_native.py
 rfcensus/decoders/meshtastic_native.py
 rfcensus/decoders/meshtastic_pipeline.py
 rfcensus/decoders/passband_detector.py
+rfcensus/decoders/passband_state_native.py
 rfcensus/decoders/registry.py
 rfcensus/decoders/shared_channelizer.py
 rfcensus/decoders/_native/lora/Makefile
@@ -49,8 +50,6 @@ rfcensus/decoders/_native/lora/README.md
 rfcensus/decoders/_native/lora/_kiss_fft_guts.h
 rfcensus/decoders/_native/lora/kiss_fft.c
 rfcensus/decoders/_native/lora/kiss_fft.h
-rfcensus/decoders/_native/lora/liblora_demod.a
-rfcensus/decoders/_native/lora/liblora_demod.so
 rfcensus/decoders/_native/lora/lora_channelizer.c
 rfcensus/decoders/_native/lora/lora_channelizer.h
 rfcensus/decoders/_native/lora/lora_chirp.c
@@ -173,6 +172,7 @@ rfcensus/tui/widgets/plan_tree.py
 rfcensus/utils/__init__.py
 rfcensus/utils/async_subprocess.py
 rfcensus/utils/hashing.py
+rfcensus/utils/iq_reader.py
 rfcensus/utils/iq_ring.py
 rfcensus/utils/iq_source.py
 rfcensus/utils/logging.py

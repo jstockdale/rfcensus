@@ -117,7 +117,13 @@ install_native_libs() {
     # need to be compiled against the user's libstdc++ to avoid
     # GLIBCXX symbol mismatch (the failure mode is dlopen returning
     # the misleading "No such file or directory" error).
-    say "Building in-tree native libraries (liblora_demod, libmeshtastic)"
+    #
+    # v0.7.15: added libpassband_state.so — the per-slot state
+    # machine port from passband_detector.py to C. ~12% perf win.
+    # Falls back to the Python implementation with a warning if
+    # the .so isn't found, so the build is not strictly required,
+    # but this script always builds it for full perf.
+    say "Building in-tree native libraries (liblora_demod, libmeshtastic, libpassband_state)"
 
     # Find the project root: this script lives in $ROOT/scripts/, so
     # walk up one level to get to the repo root regardless of where
@@ -127,11 +133,13 @@ install_native_libs() {
     local root="${script_dir%/scripts}"
     local lora_dir="$root/rfcensus/decoders/_native/lora"
     local mesh_dir="$root/rfcensus/decoders/_native/meshtastic"
+    local passband_dir="$root/rfcensus/decoders/_native/passband"
 
-    if [ ! -d "$lora_dir" ] || [ ! -d "$mesh_dir" ]; then
+    if [ ! -d "$lora_dir" ] || [ ! -d "$mesh_dir" ] || [ ! -d "$passband_dir" ]; then
         echo "  ⚠ native source dirs not found — expected at"
         echo "    $lora_dir"
         echo "    $mesh_dir"
+        echo "    $passband_dir"
         echo "  Skipping native build. Decoders will fail at runtime."
         return 1
     fi
@@ -157,6 +165,21 @@ install_native_libs() {
             return 1
         fi
     ) || return 1
+
+    # v0.7.15: passband state machine. Optional — Python fallback
+    # exists — but build it anyway for the full perf release.
+    (
+        cd "$passband_dir"
+        make clean >/dev/null 2>&1 || true
+        if make 2>&1 | tail -5; then
+            ok "libpassband_state.so built"
+        else
+            echo "  ⚠ libpassband_state build failed — pipeline will"
+            echo "    fall back to the Python state machine (~12% slower)."
+            # NOT a fatal error: the Python fallback is fully functional.
+            return 0
+        fi
+    ) || return 0
 }
 
 main() {

@@ -61,6 +61,10 @@ from rfcensus.utils.iq_source import (
     RtlTcpSource,
     find_device_index_by_serial,
 )
+from rfcensus.utils.iq_reader import (
+    IqReader,
+    DEFAULT_RING_CAPACITY_SECS,
+)
 from rfcensus.utils.meshtastic_region import (
     PRESETS, REGIONS,
     all_default_slots, default_slot,
@@ -579,8 +583,12 @@ def _print_human(rec: DecodedRecord) -> None:
              else f"  hash=0x{rec.channel_hash:02X} (no PSK)")
     extra = ""
     if rec.text is not None:
-        snippet = rec.text if len(rec.text) <= 48 else rec.text[:45] + "..."
-        extra = f"  text={snippet!r}"
+        # v0.7.15: emit the full text body. Earlier versions truncated
+        # to 48 chars with "..." which made longer messages (e.g. forum
+        # debate threads on the air) unreadable in the log. Python's
+        # repr() will already escape control chars and limit line
+        # damage from CR/LF in the body.
+        extra = f"  text={rec.text!r}"
     elif rec.lat is not None and rec.lon is not None:
         extra = f"  pos=({rec.lat:.4f},{rec.lon:.4f})"
     elif rec.telemetry:
@@ -761,6 +769,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Suppress per-packet stdout")
     p.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE,
         help="IQ chunk size in bytes")
+    p.add_argument("--reader-buffer-secs", type=float,
+        default=DEFAULT_RING_CAPACITY_SECS,
+        help=f"v0.7.16: decouple-ring capacity in seconds for live "
+             f"modes (default {DEFAULT_RING_CAPACITY_SECS}s = ~9.6 MB at "
+             f"2.4 MS/s). A reader thread fills this ring from rtl_tcp "
+             f"or rtl_sdr while the decode pipeline drains it; absorbs "
+             f"GC pauses + transient processing stalls without dropping "
+             f"samples. Set to 0 to disable (revert to v0.7.15 single-"
+             f"threaded behavior — only useful for debugging).")
     p.add_argument("--max-runtime", type=float,
         help="Stop after this many seconds (live modes only)")
 
@@ -824,7 +841,17 @@ def _resolve_device(device: str) -> int:
 
 
 def _build_source(args: argparse.Namespace) -> tuple[IQSource, int, int]:
-    """Returns (source, center_hz, sample_rate_hz)."""
+    """Returns (source, center_hz, sample_rate_hz).
+
+    v0.7.16: live sources (RtlSdrSubprocess, RtlTcpSource) are wrapped
+    in an IqReader by default — a reader thread fills a 2-second ring
+    buffer while the decode pipeline drains it. Absorbs GC pauses and
+    transient processing stalls without dropping samples. File mode
+    (FileIQSource) is NOT wrapped: the file is already faster than
+    real-time, so the threading layer would only add overhead with no
+    benefit. Set --reader-buffer-secs 0 to disable wrapping for live
+    modes (debugging only).
+    """
     if args.capture:
         if not args.capture.exists():
             raise SystemExit(f"error: {args.capture} not found")
@@ -850,10 +877,21 @@ def _build_source(args: argparse.Namespace) -> tuple[IQSource, int, int]:
     if args.rtl_tcp:
         host, _, port_str = args.rtl_tcp.partition(":")
         port = int(port_str) if port_str else 1234
-        return (RtlTcpSource(host, port, cfg, chunk_size=args.chunk_size),
-                args.frequency, sample_rate)
-    return (RtlSdrSubprocess(cfg, chunk_size=args.chunk_size),
-            args.frequency, sample_rate)
+        raw = RtlTcpSource(host, port, cfg, chunk_size=args.chunk_size)
+    else:
+        raw = RtlSdrSubprocess(cfg, chunk_size=args.chunk_size)
+
+    # v0.7.16: wrap with IqReader unless explicitly disabled.
+    if args.reader_buffer_secs > 0:
+        reader = IqReader(
+            raw,
+            sample_rate_hz=sample_rate,
+            ring_capacity_secs=args.reader_buffer_secs,
+            chunk_size=args.chunk_size,
+        )
+        reader.start()
+        return (reader, args.frequency, sample_rate)
+    return (raw, args.frequency, sample_rate)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1309,7 +1347,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                               "periodic_probe_positive",
                               "periodic_reaps", "periodic_respawns",
                               "pin_events", "unpin_events",
-                              "reap_skipped_pinned"):
+                              "reap_skipped_pinned",
+                              # v0.7.16: reap-while-decoding deferral
+                              # diagnostics. See LazyPipelineStats for
+                              # field semantics.
+                              "reap_deferred_busy",
+                              "reap_completed_after_defer",
+                              "reap_force_after_hung"):
                     if hasattr(ls, fname):
                         lazy_perf_stats[fname] = (
                             lazy_perf_stats.get(fname, 0)
@@ -1390,8 +1434,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         for key, n in sorted(per_preset_decrypt.items()):
             print(f"#   {key:<14}  {n}", file=sys.stderr)
     for key, s in final_stats.items():
+        # v0.7.16: also surface sync_ok and hdr_fail to make low-SNR
+        # captures diagnosable. preambles > 0 with sync = 0 means
+        # the chirp matches but the syncword didn't (= not Meshtastic
+        # traffic, or wrong region channel hash). sync > 0 with
+        # hdr_ok = 0 means signal is too weak to get the header
+        # through CRC (raise gain or move antenna).
         print(f"# {key:<14}  preambles={s.preambles_found}  "
-              f"hdr_ok={s.headers_decoded}  pkt_ok={s.packets_decoded}",
+              f"sync={s.syncwords_matched}  "
+              f"hdr_ok={s.headers_decoded}  hdr_fail={s.headers_failed}  "
+              f"pkt_ok={s.packets_decoded}  pkt_crc_fail={s.packets_crc_failed}",
               file=sys.stderr)
     # v0.7.10: per-channel RSSI broken down by slot frequency. The
     # flat "MediumFast: -2.8 dBFS, n=8" view didn't tell the user
@@ -1526,12 +1578,40 @@ def main(argv: Optional[list[str]] = None) -> int:
                       f"({ue} unpin · net {net_pinned:+d})  ·  "
                       f"{rsp} reap(s) skipped (slot was pinned)",
                       file=sys.stderr)
+            # v0.7.16: reap-while-decoding deferral diagnostics.
+            # Only print when something happened — quiet captures
+            # never trigger this.
+            rdb = lazy_perf_stats.get("reap_deferred_busy", 0)
+            rcad = lazy_perf_stats.get("reap_completed_after_defer", 0)
+            rfh = lazy_perf_stats.get("reap_force_after_hung", 0)
+            if rdb or rcad or rfh:
+                msg = (f"# reap-defer: {rdb} probe-tick(s) deferred "
+                       f"because decoder was busy  ·  "
+                       f"{rcad} reap(s) completed after defer")
+                if rfh:
+                    msg += f"  ·  ⚠ {rfh} force-reap(s) (hung decoder)"
+                print(msg, file=sys.stderr)
         sd = lazy_perf_stats.get("samples_dropped", 0)
         if sd > 0:
             ro = lazy_perf_stats.get("ring_overflows", 0)
             print(f"# DROPPED:     {sd:,} samples in "
                   f"{ro} ring-buffer overflow event(s) — "
                   f"these packets were lost", file=sys.stderr)
+    # v0.7.16: surface IqReader (decouple ring) stats if a reader was
+    # in use. Distinct from the lazy_pipeline lookback ring stats
+    # above — this is the SOURCE-side decouple buffer that absorbs
+    # network/processing jitter.
+    if isinstance(source, IqReader):
+        rs = source.stats()
+        if rs.ring.samples_dropped > 0:
+            print(f"# READER DROP: {rs.ring.samples_dropped:,} samples in "
+                  f"{rs.ring.overflow_events} decouple-ring overflow(s) "
+                  f"— processing fell behind the reader thread; consider "
+                  f"raising --reader-buffer-secs", file=sys.stderr)
+        elif not args.quiet:
+            cap_mb = rs.ring.capacity_bytes / 1_000_000
+            print(f"# reader:      {cap_mb:.1f}MB ring  ·  no drops",
+                  file=sys.stderr)
     if pcap_writer:
         print(f"# wrote PCAP:  {args.pcap} "
               f"({pcap_writer.packets_written} packets)", file=sys.stderr)

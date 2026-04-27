@@ -222,6 +222,16 @@ void lora_demod_get_stats(const lora_demod_t *d, lora_demod_stats_t *out) {
     if (d && out) *out = d->stats;
 }
 
+/* v0.7.16: idle = sitting in DETECT (= the only state where there's
+ * no half-decoded packet in flight). Every other state is some stage
+ * of an in-progress decode — sync detect, downchirp align, or actual
+ * payload demod. The pipeline checks this before reaping a decoder
+ * to avoid throwing away an in-flight packet. */
+int lora_demod_is_idle(const lora_demod_t *d) {
+    if (!d) return 1;  /* null = trivially idle */
+    return (d->state == LORA_STATE_DETECT) ? 1 : 0;
+}
+
 /* ────────────────────────────────────────────────────────────────────
  * Sample input — handles oversample decimation, ring write, then
  * invokes the state machine pump.
@@ -351,8 +361,8 @@ static void try_decode_packet(struct lora_demod *d) {
         out.crc_ok = crc_ok ? 1 : 0;
         out.rssi_db = d->rssi_est;
         out.snr_db = d->snr_est;
-        out.cfo_hz = (float)d->cfo_int * (float)d->cfg.bandwidth / (float)d->N
-                   + d->cfo_frac;
+        out.cfo_hz = ((float)d->cfo_int + d->cfo_frac)
+                   * (float)d->cfg.bandwidth / (float)d->N;
         out.sample_offset = d->preamble_start;
         d->cb(&out, d->userdata);
     }
@@ -588,24 +598,35 @@ static int pump_state_machine(struct lora_demod *d) {
 
             /* Got a non-preamble bin. Read the second sync symbol.
              *
-             * v0.6.16 empirical finding: the second sync symbol does
-             * NOT start at cursor+N. Probing real Meshtastic captures
-             * showed sym2 actually lives at cursor+N+N/4 — there's a
-             * quarter-symbol gap between sync_word_1 and sync_word_2.
-             * The probe data was conclusive: reading at cursor+N+0
-             * gave bin (true_value - N/4); reading at cursor+N+N/4
-             * gave bin = true_value exactly. Pattern reproduced across
-             * 9 packets at SF9.
+             * v0.6.16 empirical finding (SF9 only): the second sync
+             * symbol does NOT start at cursor+N. Probing real Meshtastic
+             * captures showed sym2 actually lives at cursor+N+128 —
+             * there's a 128-sample gap between sync_word_1 end and
+             * sync_word_2 start. The probe data was conclusive:
+             * reading at cursor+N+0 gave bin (true_value - 128);
+             * reading at cursor+N+128 gave bin = true_value exactly.
+             * Pattern reproduced across 9 packets at SF9.
              *
-             * Why the gap? Suspected cause: Meshtastic / SX127x adds
-             * a quarter-symbol downchirp suffix to sync_word_1 (similar
-             * to the QUARTER_DOWN at end of preamble) that gr-lora
-             * handles in its preamble state machine but isn't called
-             * out in the basic spec. Investigating further is a TODO
-             * but the empirical fix is solid against this fixture. */
-            if (d->ring_w < d->read_cursor + 2 * N + N / 4) return pkts;
+             * v0.7.16 generalization: ORIGINAL code used cursor+N+N/4
+             * which happens to equal cursor+N+128 ONLY at SF9 (where
+             * N=512). For SF11 (N=2048) this gave cursor+N+512,
+             * 384 samples LATE — sym2 bin landed at value+384 which
+             * fails the nibble-rounding check. Real LongFast capture
+             * at SF11 confirmed: sym2 actually starts at cursor+N+128
+             * regardless of SF. Likely cause: a fixed hardware-clock
+             * gap in the SX127x Tx path, unrelated to N.
+             *
+             * Conservative rollout: for SF<=9 (N<=512) preserve the
+             * existing N/4 formula — it agrees with the constant 128
+             * at SF9 and we have no field data at SF7/SF8 to motivate
+             * a behavior change there. For SF>=10 (N>=1024) use the
+             * verified constant 128. Matches both empirical findings
+             * and only changes behavior in the SF range that was
+             * never working before. */
+            uint32_t sync_gap = (N <= 512) ? (N / 4) : 128;
+            if (d->ring_w < d->read_cursor + 2 * N + sync_gap) return pkts;
             cf_t buf2[4096];
-            lora_ring_read(d, d->read_cursor + N + N / 4, buf2);
+            lora_ring_read(d, d->read_cursor + N + sync_gap, buf2);
             float m2;
             uint16_t b2 = lora_symbol_demod(d, buf2, &m2);
 
